@@ -179,6 +179,9 @@ pub struct Scanner {
 
     /// If set, this scanner serves only these fragments.
     fragments: Option<Vec<Fragment>>,
+
+    /// If set, this scanner serves only these row ids.
+    selection_ids: Option<Arc<dyn Array>>,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -210,6 +213,7 @@ impl Scanner {
             with_row_address: false,
             ordered: true,
             fragments: None,
+            selection_ids: None,
         }
     }
 
@@ -359,6 +363,38 @@ impl Scanner {
     pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter = Some(filter);
         self
+    }
+
+    /// Sets the selection_ids with some validations.
+    /// 
+    /// - `selection_ids`: Must be an `Option<Arc<dyn Array>>` where the array is of type `UInt64`.
+    /// - Ensures that either `selection_ids` is set or `filter` is set, but not both.
+    /// - Disallows setting if `prefilter` is false (assuming `prefilter` is a field or can be inferred).
+    pub fn selection_ids(&mut self, selection_ids: Option<Arc<dyn Array>>) -> Result<&mut Self> {
+        // Check if prefilter is false
+        if !self.prefilter {
+            return Err(Error::io("Setting selection_ids is disallowed when prefilter is false.".to_string(), location!()));
+        }
+
+        // Check if the array is of type UInt64 if it's Some.
+        if let Some(ref array) = selection_ids {
+            if array.data_type() != &DataType::UInt64 {
+                return Err(Error::io("selection_ids must be of type UInt64.".to_string(), location!()));
+            }
+        }
+
+        // Logic to ensure that `selection_ids` and `filter` are not both set.
+        match (&self.selection_ids, &self.filter) {
+            (Some(_), Some(_)) => {
+                return Err(Error::io("selection_ids and filter cannot both be set.".to_string(), location!()));
+            },
+            _ => {} // Valid state, do nothing.
+        }
+
+        // If all checks pass, set the selection_ids.
+        self.selection_ids = selection_ids;
+
+        Ok(self)
     }
 
     /// Set the batch size.
@@ -1408,8 +1444,9 @@ impl Scanner {
             &filter_plan.index_query,
             &filter_plan.refine_expr,
             self.prefilter,
+            &self.selection_ids,
         ) {
-            (Some(index_query), Some(refine_expr), _) => {
+            (Some(index_query), Some(refine_expr), _, None) => {
                 // The filter is only partially satisfied by the index.  We need
                 // to do an indexed scan and then refine the results to determine
                 // the row ids.
@@ -1424,7 +1461,7 @@ impl Scanner {
                     Arc::new(FilterExec::try_new(physical_refine_expr, filter_input)?);
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
-            (Some(index_query), None, true) => {
+            (Some(index_query), None, true, None) => {
                 // The filter is completely satisfied by the index.  We
                 // only need to search the index to determine the valid row
                 // ids.
@@ -1434,7 +1471,7 @@ impl Scanner {
                 ));
                 PreFilterSource::ScalarIndexQuery(index_query)
             }
-            (None, Some(refine_expr), true) => {
+            (None, Some(refine_expr), true, None) => {
                 // No indices match the filter.  We need to do a full scan
                 // of the filter columns to determine the valid row ids.
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
@@ -1447,8 +1484,12 @@ impl Scanner {
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             }
             // No prefilter
-            (None, None, true) => PreFilterSource::None,
-            (_, _, false) => PreFilterSource::None,
+            (None, None, true, None) => PreFilterSource::None,
+            (_, _, false, None) => PreFilterSource::None,
+            // Selection ids provided
+            (_, _, false, Some(_)) => unreachable!(), // disallow selection_ids when prefilter is false
+            (_, _, true, Some(selection_ids)) => PreFilterSource::ProvidedRowIds(Arc::clone(selection_ids)),
+
         };
 
         let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;

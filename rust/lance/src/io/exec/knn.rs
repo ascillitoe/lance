@@ -8,7 +8,7 @@ use arrow::datatypes::UInt32Type;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
-    ArrayRef, RecordBatch, StringArray, UInt64Array,
+    ArrayRef, RecordBatch, StringArray, UInt64Array, Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -269,6 +269,36 @@ impl FilterLoader for SelectionVectorToPrefilter {
     }
 }
 
+// Utility to convert a provided row id mask into a prefilter
+struct DirectRowIdFilterLoader {
+    row_ids: Arc<dyn Array>,
+}
+
+impl DirectRowIdFilterLoader {
+    fn new(row_ids: Arc<dyn Array>) -> Self {
+        Self { row_ids }
+    }
+}
+
+#[async_trait]
+impl FilterLoader for DirectRowIdFilterLoader {
+    async fn load(self: Box<Self>) -> Result<RowIdMask> {
+        // Attempt to downcast `Array` to a specific type, e.g., `UInt64Array`
+        let uint64_array = self.row_ids.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| Error::Internal {
+            message: format!(
+                "Expected an UInt64Array but got {}",
+                self.row_ids.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        let allow_list = RowIdTreeMap::from_iter(uint64_array.iter().flatten());
+        let mask = RowIdMask::from_allowed(allow_list);
+
+        Ok(mask)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {
     /// The prefilter input is an array of row ids that match the filter condition
@@ -277,6 +307,8 @@ pub enum PreFilterSource {
     ScalarIndexQuery(Arc<dyn ExecutionPlan>),
     /// There is no prefilter
     None,
+    /// The prefilter input is an array of row ids provided by the user
+    ProvidedRowIds(Arc<dyn Array>),
 }
 
 lazy_static::lazy_static! {
@@ -554,6 +586,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             PreFilterSource::None => vec![self.input.clone()],
             PreFilterSource::FilteredRowIds(src) => vec![self.input.clone(), src.clone()],
             PreFilterSource::ScalarIndexQuery(src) => vec![self.input.clone(), src.clone()],
+            PreFilterSource::ProvidedRowIds(_) => vec![self.input.clone()],
         }
     }
 
@@ -653,6 +686,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                                     as Box<dyn FilterLoader>)
                             }
                             PreFilterSource::None => None,
+                            PreFilterSource::ProvidedRowIds(row_id_mask) => {
+                                // Here you would use your implementation that can handle the provided row IDs directly.
+                                // This is a placeholder for your actual implementation.
+                                Some(Box::new(DirectRowIdFilterLoader::new(row_id_mask.clone())) as Box<dyn FilterLoader>)
+                            }
                         };
                         let pre_filter = Arc::new(DatasetPreFilter::new(
                             ds.clone(),

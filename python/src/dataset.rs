@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
+use arrow_array::{Float32Array, UInt64Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -432,6 +432,7 @@ impl Dataset {
         with_row_id: Option<bool>,
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
+        selection_ids: Option<Vec<u64>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -469,6 +470,18 @@ impl Dataset {
         }
         if let Some(prefilter) = prefilter {
             scanner.prefilter(prefilter);
+        }
+
+        // Assuming `selection_ids` is of type Option<Vec<u64>> at this point
+        let selection_ids_array: Option<Arc<dyn Array>> = selection_ids.map(|ids| {
+            let arr: Arc<dyn Array> = Arc::new(UInt64Array::from(ids));
+            arr
+        });
+
+        // Corrected to use `selection_ids_array` after conversion
+        if let Some(ids) = selection_ids_array {
+            scanner.selection_ids(Some(ids))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
         scanner

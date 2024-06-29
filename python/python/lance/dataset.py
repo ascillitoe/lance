@@ -243,6 +243,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        selection_ids: Optional[Union[List[int], pa.Array]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -295,6 +296,8 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        selection_ids : List Array or array-like
+            If specified, only run the vector query on the rows within this selection.
 
         Notes
         -----
@@ -331,6 +334,7 @@ class LanceDataset(pa.dataset.Dataset):
             .with_fragments(fragments)
             .with_row_id(with_row_id)
             .use_stats(use_stats)
+            .selection_ids(selection_ids)
         )
         if nearest is not None:
             builder = builder.nearest(**nearest)
@@ -365,6 +369,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        selection_ids: Optional[Union[List[int], pa.Array]] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -432,6 +437,7 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
             use_stats=use_stats,
+            selection_ids=selection_ids,
         ).to_table()
 
     @property
@@ -481,6 +487,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: bool = False,
         with_row_id: bool = False,
         use_stats: bool = True,
+        selection_ids: Optional[Union[List[int], pa.Array]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -507,6 +514,7 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
             use_stats=use_stats,
+            selection_ids=selection_ids,
         ).to_batches()
 
     def sample(
@@ -2123,6 +2131,15 @@ class ScannerBuilder:
         self._fragments = fragments
         return self
 
+    def selection_ids(self, selection_ids: Optional[Union[List[int], np.ndarray]]):
+        #if selection_ids is not None:
+       #     # Convert input to numpy array of type uint64
+       #     selection_ids = np.array(selection_ids, dtype="uint64")
+       #     # Convert numpy array to PyArrow array of type uint64
+       #     selection_ids = pa.array(selection_ids, type=pa.uint64())
+        self._selection_ids = selection_ids
+        return self 
+
     def nearest(
         self,
         column: str,
@@ -2186,6 +2203,7 @@ class ScannerBuilder:
             self._with_row_id,
             self._use_stats,
             self._substrait_filter,
+            self._selection_ids,
         )
         return LanceScanner(scanner, self.ds)
 
