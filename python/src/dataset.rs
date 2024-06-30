@@ -472,13 +472,11 @@ impl Dataset {
             scanner.prefilter(prefilter);
         }
 
-        // Assuming `selection_ids` is of type Option<Vec<u64>> at this point
+        // TODO - converting from Vec<u64> to Arc<dyn Array>. This is a temporary solution
         let selection_ids_array: Option<Arc<dyn Array>> = selection_ids.map(|ids| {
             let arr: Arc<dyn Array> = Arc::new(UInt64Array::from(ids));
             arr
         });
-
-        // Corrected to use `selection_ids_array` after conversion
         if let Some(ids) = selection_ids_array {
             scanner.selection_ids(Some(ids))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;

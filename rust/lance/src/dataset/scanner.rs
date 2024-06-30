@@ -384,11 +384,8 @@ impl Scanner {
         }
 
         // Logic to ensure that `selection_ids` and `filter` are not both set.
-        match (&self.selection_ids, &self.filter) {
-            (Some(_), Some(_)) => {
-                return Err(Error::io("selection_ids and filter cannot both be set.".to_string(), location!()));
-            },
-            _ => {} // Valid state, do nothing.
+        if self.filter.is_some() {
+            return Err(Error::io("selection_ids and filter cannot both be set.".to_string(), location!()));
         }
 
         // If all checks pass, set the selection_ids.
