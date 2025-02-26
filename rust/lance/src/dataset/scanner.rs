@@ -1776,6 +1776,26 @@ impl Scanner {
                     vector_scan_projection.into_schema_ref(),
                 )
             };
+
+            // Filter by ProvidedRowIDs if selection_ids is set
+            if let Some(selection_ids) = &self.selection_ids {
+                let row_id_expr = expressions::col(ROW_ID, plan.schema().as_ref())?;
+                let selection_ids_array = selection_ids
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .ok_or_else(|| Error::io("Failed to downcast selection_ids to UInt64Array".to_string(), location!()))?;
+                let selection_ids_expr = expressions::in_list(
+                    row_id_expr,
+                    selection_ids_array
+                        .iter()
+                        .map(|id| expressions::lit(id.unwrap()))
+                        .collect(),
+                    &false,
+                    plan.schema().as_ref(),
+                )?;
+                plan = Arc::new(FilterExec::try_new(selection_ids_expr, plan)?);
+            }
+
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 let planner = Planner::new(plan.schema());
                 let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
@@ -1845,6 +1865,26 @@ impl Scanner {
                 let physical_refine_expr = planner.create_physical_expr(expr)?;
                 scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
             }
+
+            // Filter by ProvidedRowIDs if selection_ids is set
+            if let Some(selection_ids) = &self.selection_ids {
+                let row_id_expr = expressions::col(ROW_ID, scan_node.schema().as_ref())?;
+                let selection_ids_array = selection_ids
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .ok_or_else(|| Error::io("Failed to downcast selection_ids to UInt64Array".to_string(), location!()))?;
+                let selection_ids_expr = expressions::in_list(
+                    row_id_expr,
+                    selection_ids_array
+                        .iter()
+                        .map(|id| expressions::lit(id.unwrap()))
+                        .collect(),
+                    &false,
+                    scan_node.schema().as_ref(),
+                )?;
+                scan_node = Arc::new(FilterExec::try_new(selection_ids_expr, scan_node)?);
+            }
+
             // first we do flat search on just the new data
             let topk_appended = self.flat_knn(scan_node, &q)?;
 
