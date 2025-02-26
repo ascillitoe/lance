@@ -2326,8 +2326,10 @@ impl Scanner {
             // Selection ids provided
             (_, _, false, Some(_)) => unreachable!(), // disallow selection_ids when prefilter is false
             (_, _, true, Some(selection_ids)) => {
-                let row_id_mask = RowIdMask::from_arrow(selection_ids.as_ref().as_any().downcast_ref().unwrap())?;
-                PreFilterSource::ProvidedRowIds(row_id_mask)
+            let uint64_array = selection_ids.as_ref().as_any().downcast_ref::<arrow_array::UInt64Array>()
+                .ok_or(Error::io("Failed to downcast selection_ids to UInt64Array".to_string(), location!()))?;
+            let row_id_mask = RowIdMask::from_uint64_array(uint64_array)?;
+            PreFilterSource::ProvidedRowIds(row_id_mask)
             }
         };
 

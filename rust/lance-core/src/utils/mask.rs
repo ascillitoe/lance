@@ -6,7 +6,8 @@ use std::io::Write;
 use std::ops::RangeBounds;
 use std::{collections::BTreeMap, io::Read};
 
-use arrow_array::{Array, BinaryArray, GenericBinaryArray};
+use arrow_array::{Array, BinaryArray, GenericBinaryArray, UInt64Array};
+
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use deepsize::DeepSizeOf;
@@ -203,6 +204,15 @@ impl RowIdMask {
             block_list,
             allow_list,
         })
+    }
+
+    // Add this new method to convert UInt64Array to RowIdMask
+    pub fn from_uint64_array(array: &UInt64Array) -> Result<Self> {
+        let mut allow_list = RowIdTreeMap::new();
+        for id in array.values() {
+            allow_list.insert(*id);
+        }
+        Ok(Self::from_allowed(allow_list))
     }
 }
 
