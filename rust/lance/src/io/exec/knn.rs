@@ -42,7 +42,8 @@ use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
 
-use super::utils::{FilteredRowIdsToPrefilter, PreFilterSource, SelectionVectorToPrefilter};
+use super::utils::{FilteredRowIdsToPrefilter, PreFilterSource, SelectionVectorToPrefilter,
+    DirectRowIdFilterLoader};
 
 /// [ExecutionPlan] compute vector distance from a query vector.
 ///
@@ -505,6 +506,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             PreFilterSource::None => vec![&self.input],
             PreFilterSource::FilteredRowIds(src) => vec![&self.input, &src],
             PreFilterSource::ScalarIndexQuery(src) => vec![&self.input, &src],
+            PreFilterSource::ProvidedRowIds(_) => vec![&self.input],
         }
     }
 
@@ -607,6 +609,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                                     as Box<dyn FilterLoader>)
                             }
                             PreFilterSource::None => None,
+                            PreFilterSource::ProvidedRowIds(row_id_mask) => {
+                                Some(Box::new(DirectRowIdFilterLoader::new(row_id_mask.clone()))
+                                    as Box<dyn FilterLoader>)
+                            }
                         };
                         let pre_filter = Arc::new(DatasetPreFilter::new(
                             ds.clone(),

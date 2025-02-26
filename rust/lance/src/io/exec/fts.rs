@@ -94,6 +94,7 @@ impl ExecutionPlan for FtsExec {
             PreFilterSource::None => vec![],
             PreFilterSource::FilteredRowIds(src) => vec![&src],
             PreFilterSource::ScalarIndexQuery(src) => vec![&src],
+            PreFilterSource::ProvidedRowIds(_) => unreachable!(),
         }
     }
 
@@ -118,6 +119,7 @@ impl ExecutionPlan for FtsExec {
                     PreFilterSource::ScalarIndexQuery(_) => {
                         PreFilterSource::ScalarIndexQuery(src.clone())
                     }
+                    PreFilterSource::ProvidedRowIds(_) => unreachable!(),
                     PreFilterSource::None => {
                         return Err(DataFusionError::Internal(
                             "Unexpected prefilter source".to_string(),
@@ -173,6 +175,8 @@ impl ExecutionPlan for FtsExec {
                             Some(Box::new(SelectionVectorToPrefilter(stream))
                                 as Box<dyn FilterLoader>)
                         }
+                        PreFilterSource::ProvidedRowIds(_) => unreachable!(),
+
                         PreFilterSource::None => None,
                     };
                     let pre_filter = Arc::new(DatasetPreFilter::new(

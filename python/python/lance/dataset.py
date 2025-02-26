@@ -322,6 +322,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        selection_ids: Optional[Union[List[int], pa.Array]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -414,6 +415,8 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
+        selection_ids : List Array or array-like
+            If specified, only run the vector query on the rows within this selection.
 
         Notes
         -----
@@ -463,6 +466,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.fast_search, fast_search)
+        setopt(builder.selection_ids, selection_ids)
 
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
@@ -543,6 +547,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        selection_ids: Optional[Union[List[int], pa.Array]] = None,
     ) -> pa.Table:
         """Read the data into memory as a :py:class:`pyarrow.Table`
 
@@ -639,6 +644,7 @@ class LanceDataset(pa.dataset.Dataset):
             use_stats=use_stats,
             fast_search=fast_search,
             full_text_query=full_text_query,
+            selection_ids=selection_ids,
         ).to_table()
 
     @property
@@ -723,6 +729,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        selection_ids: Optional[Union[List[int], pa.Array]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -754,6 +761,7 @@ class LanceDataset(pa.dataset.Dataset):
             with_row_address=with_row_address,
             use_stats=use_stats,
             full_text_query=full_text_query,
+            selection_ids=selection_ids,
         ).to_batches()
 
     def sample(
@@ -2986,6 +2994,7 @@ class ScannerBuilder:
         self._fast_search = False
         self._full_text_query = None
         self._use_scalar_index = None
+        self._selection_ids = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -3196,6 +3205,15 @@ class ScannerBuilder:
         self._fragments = fragments
         return self
 
+    def selection_ids(self, selection_ids: Optional[Union[List[int], np.ndarray]]):
+        #if selection_ids is not None:
+       #     # Convert input to numpy array of type uint64
+       #     selection_ids = np.array(selection_ids, dtype="uint64")
+       #     # Convert numpy array to PyArrow array of type uint64
+       #     selection_ids = pa.array(selection_ids, type=pa.uint64())
+        self._selection_ids = selection_ids
+        return self 
+
     def nearest(
         self,
         column: str,
@@ -3300,6 +3318,7 @@ class ScannerBuilder:
             self._full_text_query,
             self._late_materialization,
             self._use_scalar_index,
+            self._selection_ids,
         )
         return LanceScanner(scanner, self.ds)
 

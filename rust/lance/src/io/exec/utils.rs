@@ -24,6 +24,8 @@ pub enum PreFilterSource {
     FilteredRowIds(Arc<dyn ExecutionPlan>),
     /// The prefilter input is a selection vector from an index query
     ScalarIndexQuery(Arc<dyn ExecutionPlan>),
+    // The prefilter input is provided directly as a RowIdMask
+    ProvidedRowIds(RowIdMask),
     /// There is no prefilter
     None,
 }
@@ -74,6 +76,24 @@ impl FilterLoader for SelectionVectorToPrefilter {
                 location: location!(),
             }
         })?)
+    }
+}
+
+// Utility to convert a provided row id mask into a prefilter
+pub(crate) struct DirectRowIdFilterLoader {
+    row_id_mask: RowIdMask,
+}
+
+impl DirectRowIdFilterLoader {
+    pub fn new(row_id_mask: RowIdMask) -> Self {
+        Self { row_id_mask }
+    }
+}
+
+#[async_trait]
+impl FilterLoader for DirectRowIdFilterLoader {
+    async fn load(self: Box<Self>) -> Result<RowIdMask> {
+        Ok(self.row_id_mask)
     }
 }
 

@@ -20,7 +20,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{make_array, RecordBatch, RecordBatchReader};
+use arrow_array::{make_array, UInt64Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -485,7 +485,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, selection_ids=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -509,6 +509,7 @@ impl Dataset {
         full_text_query: Option<&Bound<'_, PyDict>>,
         late_materialization: Option<PyObject>,
         use_scalar_index: Option<bool>,
+        selection_ids: Option<Vec<u64>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -569,6 +570,16 @@ impl Dataset {
         }
         if let Some(prefilter) = prefilter {
             scanner.prefilter(prefilter);
+        }
+
+        // TODO - converting from Vec<u64> to Arc<dyn Array>. This is a temporary solution
+        let selection_ids_array: Option<Arc<dyn Array>> = selection_ids.map(|ids| {
+            let arr: Arc<dyn Array> = Arc::new(UInt64Array::from(ids));
+            arr
+        });
+        if let Some(ids) = selection_ids_array {
+            scanner.selection_ids(Some(ids))
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
         scanner

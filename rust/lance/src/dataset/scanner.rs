@@ -69,6 +69,7 @@ use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
+use lance_core::utils::mask::RowIdMask;
 use crate::{Error, Result};
 use snafu::location;
 
@@ -321,6 +322,8 @@ pub struct Scanner {
     /// If set, this scanner serves only these fragments.
     fragments: Option<Vec<Fragment>>,
 
+    /// If set, this scanner serves only these row ids.
+    selection_ids: Option<Arc<dyn Array>>,
     /// Only search the data being indexed (weak consistency search).
     ///
     /// Default value is false.
@@ -364,6 +367,7 @@ impl Scanner {
             with_row_address: false,
             ordered: true,
             fragments: None,
+            selection_ids: None,
             fast_search: false,
             use_scalar_index: true,
         }
@@ -537,6 +541,35 @@ impl Scanner {
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter = Some(LanceFilter::Datafusion(filter));
         self
+    }
+
+    /// Sets the selection_ids with some validations.
+    /// 
+    /// - `selection_ids`: Must be an `Option<Arc<dyn Array>>` where the array is of type `UInt64`.
+    /// - Ensures that either `selection_ids` is set or `filter` is set, but not both.
+    /// - Disallows setting if `prefilter` is false (assuming `prefilter` is a field or can be inferred).
+    pub fn selection_ids(&mut self, selection_ids: Option<Arc<dyn Array>>) -> Result<&mut Self> {
+        // Check if prefilter is false
+        if !self.prefilter {
+            return Err(Error::io("Setting selection_ids is disallowed when prefilter is false.".to_string(), location!()));
+        }
+
+        // Check if the array is of type UInt64 if it's Some.
+        if let Some(ref array) = selection_ids {
+            if array.data_type() != &DataType::UInt64 {
+                return Err(Error::io("selection_ids must be of type UInt64.".to_string(), location!()));
+            }
+        }
+
+        // Logic to ensure that `selection_ids` and `filter` are not both set.
+        if self.filter.is_some() {
+            return Err(Error::io("selection_ids and filter cannot both be set.".to_string(), location!()));
+        }
+
+        // If all checks pass, set the selection_ids.
+        self.selection_ids = selection_ids;
+
+        Ok(self)
     }
 
     /// Set the batch size.
@@ -2279,8 +2312,9 @@ impl Scanner {
             &filter_plan.refine_expr,
             self.prefilter,
             filter_plan.skip_recheck,
+            &self.selection_ids,
         ) {
-            (Some(_), Some(_), _, _) | (Some(_), None, true, false) => {
+            (Some(_), Some(_), _, _, None) | (Some(_), None, true, false, None) => {
                 // Prefilter source is covered by an index but either that index needs a recheck or there
                 // is a refine expression that needs to be applied to the results so we need to do a full
                 // filtered scan
@@ -2289,7 +2323,7 @@ impl Scanner {
                     .await?;
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
-            (Some(index_query), None, true, true) => {
+            (Some(index_query), None, true, true, None) => {
                 // Index scan doesn't honor the fragment allowlist today.
                 // TODO: we could filter the index scan results to only include the allowed fragments.
                 self.ensure_not_fragment_scan()?;
@@ -2303,7 +2337,7 @@ impl Scanner {
                 ));
                 PreFilterSource::ScalarIndexQuery(index_query)
             }
-            (None, Some(refine_expr), true, _) => {
+            (None, Some(refine_expr), true, _, None) => {
                 // No indices match the filter.  We need to do a full scan
                 // of the filter columns to determine the valid row ids.
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
@@ -2315,9 +2349,17 @@ impl Scanner {
                     Arc::new(FilterExec::try_new(physical_refine_expr, filter_input)?);
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             }
+            // Selection ids provided
+            (_, _, false, _, Some(_)) => unreachable!(), // disallow selection_ids when prefilter is false
+            (_, _, true, _, Some(selection_ids)) => {
+            let uint64_array = selection_ids.as_ref().as_any().downcast_ref::<arrow_array::UInt64Array>()
+                .ok_or(Error::io("Failed to downcast selection_ids to UInt64Array".to_string(), location!()))?;
+            let row_id_mask = RowIdMask::from_uint64_array(uint64_array)?;
+            PreFilterSource::ProvidedRowIds(row_id_mask)
+            }
             // No prefilter
-            (None, None, true, _) => PreFilterSource::None,
-            (_, _, false, _) => PreFilterSource::None,
+            (None, None, true, _, None) => PreFilterSource::None,
+            (_, _, false, _, None) => PreFilterSource::None,
         };
 
         Ok(prefilter_source)
