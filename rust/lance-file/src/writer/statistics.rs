@@ -486,7 +486,7 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
 fn cast_dictionary_arrays<'a, T: ArrowDictionaryKeyType + 'static>(
     arrays: &'a [&'a ArrayRef],
-) -> Vec<&Arc<dyn Array>> {
+) -> Vec<&'a Arc<dyn Array>> {
     arrays
         .iter()
         .map(|x| x.as_dictionary::<T>().values())
@@ -660,7 +660,7 @@ impl StatisticsCollector {
         });
 
         let schema = Arc::new(ArrowSchema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), arrays);
+        let batch = RecordBatch::try_new(schema, arrays);
         match batch {
             Ok(batch) => Ok(batch),
             _ => Err(ArrowError::SchemaError(
@@ -924,8 +924,7 @@ impl StatisticsBuilder {
             DataType::LargeUtf8 => self.string_statistics_appender::<i64>(row),
             // Dictionary type is not needed here. We collected stats for values.
             _ => {
-                println!("Stats collection for {} is not supported yet", self.dt);
-                todo!()
+                todo!("Stats collection for {} is not supported yet", self.dt);
             }
         }
     }
@@ -1424,7 +1423,7 @@ mod tests {
                         ),
                     },
                 },
-                // Sting is not incremented if it's exact lenght of the limit
+                // Sting is not incremented if it's exact length of the limit
                 TestCase {
                     source_arrays: vec![Arc::new(StringArray::from(vec![format!(
                         "{}{}",
@@ -1472,7 +1471,7 @@ mod tests {
                         ))),
                     },
                 },
-                // Sting is not incremented if it's exact lenght of the limit
+                // Sting is not incremented if it's exact length of the limit
                 TestCase {
                     source_arrays: vec![Arc::new(LargeStringArray::from(vec![format!(
                         "{}{}",
@@ -1564,7 +1563,7 @@ mod tests {
                 },
                 TestCase {
                     source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
-                        min_binary_value.clone().as_ref(),
+                        min_binary_value.as_slice(),
                     ]))],
                     stats: StatisticsRow {
                         null_count: 0,
@@ -1574,17 +1573,14 @@ mod tests {
                         ),
                         max_value: ScalarValue::FixedSizeBinary(
                             BINARY_PREFIX_LENGTH.try_into().unwrap(),
-                            Some(min_binary_value.clone()),
+                            Some(min_binary_value),
                         ),
                     },
                 },
                 TestCase {
-                    source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![vec![
-                        0xFFu8;
-                        BINARY_PREFIX_LENGTH
-                            + 7
-                    ]
-                    .as_ref()]))],
+                    source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
+                        &[0xFFu8; BINARY_PREFIX_LENGTH + 7],
+                    ]))],
                     stats: StatisticsRow {
                         null_count: 0,
                         min_value: ScalarValue::FixedSizeBinary(
@@ -1642,7 +1638,7 @@ mod tests {
         let dictionary_array_1 =
             Arc::new(DictionaryArray::try_new(indices_1, dictionary.clone()).unwrap()) as ArrayRef;
         let dictionary_array_2 =
-            Arc::new(DictionaryArray::try_new(indices_2, dictionary.clone()).unwrap()) as ArrayRef;
+            Arc::new(DictionaryArray::try_new(indices_2, dictionary).unwrap()) as ArrayRef;
         let array_refs = vec![&dictionary_array_1, &dictionary_array_2];
         let stats = collect_statistics(&array_refs);
         assert_eq!(
@@ -2033,7 +2029,7 @@ mod tests {
             let timeunits = [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond];
 
             let timezone = timezones[timezone_index].clone();
-            let timeunit = timeunits[timeunit_index].clone();
+            let timeunit = timeunits[timeunit_index];
             let value = match timeunit {
                 TimeUnit::Second => ScalarValue::TimestampSecond(value, timezone),
                 TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(value, timezone),
@@ -2042,7 +2038,7 @@ mod tests {
             };
 
             assert_min_max_constant_property(value.clone(), false)?;
-            assert_min_max_constant_property(value.clone(), true)?;
+            assert_min_max_constant_property(value, true)?;
         }
     }
 

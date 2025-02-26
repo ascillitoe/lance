@@ -12,7 +12,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use lance_arrow::*;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder},
@@ -104,7 +104,6 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
 /// Read a Protobuf-backed struct at file position: `pos`.
 // TODO: pub(crate)
 pub async fn read_struct<
-    'm,
     M: Message + Default + 'static,
     T: ProtoStruct<Proto = M> + TryFrom<M, Error = Error>,
 >(
@@ -118,11 +117,7 @@ pub async fn read_struct<
 pub async fn read_last_block(reader: &dyn Reader) -> object_store::Result<Bytes> {
     let file_size = reader.size().await?;
     let block_size = reader.block_size();
-    let begin = if file_size < block_size {
-        0
-    } else {
-        file_size - block_size
-    };
+    let begin = file_size.saturating_sub(block_size);
     reader.get_range(begin..file_size).await
 }
 
@@ -178,13 +173,12 @@ pub fn read_struct_from_buf<
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use bytes::Bytes;
-    use object_store::{memory::InMemory, path::Path};
+    use object_store::path::Path;
 
     use crate::{
         object_reader::CloudObjectReader,
+        object_store::{ObjectStore, DEFAULT_DOWNLOAD_RETRY_COUNT},
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
         utils::read_struct,
@@ -215,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_proto_structs() {
-        let store = InMemory::new();
+        let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
@@ -227,7 +221,9 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let object_reader = CloudObjectReader::new(Arc::new(store), path, 1024, None).unwrap();
+        let object_reader =
+            CloudObjectReader::new(store.inner, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
+                .unwrap();
         let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(some_message, actual);
     }

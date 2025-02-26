@@ -10,7 +10,11 @@ use std::{
 
 use arrow_array::{RecordBatch, UInt32Array};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
+use lance_arrow::RecordBatchExt;
+use lance_core::ROW_ID;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
@@ -18,7 +22,7 @@ use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::prefilter::PreFilter;
@@ -263,11 +267,37 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         }))
     }
 
+    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
+        let store = self.storage.as_ref().ok_or(Error::Index {
+            message: "vector storage not loaded".to_string(),
+            location: location!(),
+        })?;
+
+        let schema = if with_vector {
+            store.schema().clone()
+        } else {
+            let schema = store.schema();
+            let row_id_idx = schema.index_of(ROW_ID)?;
+            Arc::new(schema.project(&[row_id_idx])?)
+        };
+
+        let batches = store
+            .to_batches()?
+            .map(|b| {
+                let batch = b.project_by_schema(&schema)?;
+                Ok(batch)
+            })
+            .collect::<Vec<_>>();
+        let stream = futures::stream::iter(batches);
+        let stream = RecordBatchStreamAdapter::new(schema, stream);
+        Ok(Box::pin(stream))
+    }
+
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
         Box::new(self.storage.as_ref().unwrap().row_ids())
     }
 
-    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         Err(Error::Index {
             message: "Remapping HNSW in this way not supported".to_string(),
             location: location!(),

@@ -12,14 +12,14 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::TryStreamExt;
 use lance::{io::ObjectStore, Dataset};
-use lance_core::Result;
+use lance_core::{cache::FileMetadataCache, Result};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
 use lance_index::scalar::{
-    btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+    btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
     flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
-    IndexStore, ScalarIndex, ScalarQuery,
+    IndexStore, SargableQuery, ScalarIndex,
 };
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -43,8 +43,15 @@ impl BenchmarkDataSource {
 }
 
 #[async_trait]
-impl BtreeTrainingSource for BenchmarkDataSource {
+impl TrainingSource for BenchmarkDataSource {
     async fn scan_ordered_chunks(
+        self: Box<Self>,
+        _chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        Ok(reader_to_stream(Box::new(Self::test_data())))
+    }
+
+    async fn scan_unordered_chunks(
         self: Box<Self>,
         _chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
@@ -57,7 +64,11 @@ impl BenchmarkFixture {
         let test_path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path, None))
+        Arc::new(LanceIndexStore::new(
+            object_store,
+            test_path,
+            FileMetadataCache::no_cache(),
+        ))
     }
 
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {
@@ -76,6 +87,7 @@ impl BenchmarkFixture {
             Box::new(BenchmarkDataSource {}),
             &sub_index_trainer,
             index_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE as u32,
         )
         .await
         .unwrap();
@@ -114,10 +126,10 @@ async fn baseline_equality_search(fixture: &BenchmarkFixture) {
 
 async fn warm_indexed_equality_search(index: &BTreeIndex) {
     let row_ids = index
-        .search(&ScalarQuery::Equals(ScalarValue::UInt32(Some(10000))))
+        .search(&SargableQuery::Equals(ScalarValue::UInt32(Some(10000))))
         .await
         .unwrap();
-    assert_eq!(row_ids.len(), 1);
+    assert_eq!(row_ids.len(), Some(1));
 }
 
 async fn baseline_inequality_search(fixture: &BenchmarkFixture) {
@@ -140,19 +152,19 @@ async fn baseline_inequality_search(fixture: &BenchmarkFixture) {
 
 async fn warm_indexed_inequality_search(index: &BTreeIndex) {
     let row_ids = index
-        .search(&ScalarQuery::Range(
+        .search(&SargableQuery::Range(
             std::ops::Bound::Included(ScalarValue::UInt32(Some(50_000_000))),
             std::ops::Bound::Unbounded,
         ))
         .await
         .unwrap();
     // 100Mi - 50M = 54,857,600
-    assert_eq!(row_ids.len(), 54857600);
+    assert_eq!(row_ids.len(), Some(54857600));
 }
 
 async fn warm_indexed_isin_search(index: &BTreeIndex) {
     let row_ids = index
-        .search(&ScalarQuery::IsIn(vec![
+        .search(&SargableQuery::IsIn(vec![
             ScalarValue::UInt32(Some(10000)),
             ScalarValue::UInt32(Some(50000000)),
             ScalarValue::UInt32(Some(150000000)), // Not found
@@ -161,7 +173,7 @@ async fn warm_indexed_isin_search(index: &BTreeIndex) {
         .await
         .unwrap();
     // Only 3 because 150M is not in dataset
-    assert_eq!(row_ids.len(), 3);
+    assert_eq!(row_ids.len(), Some(3));
 }
 
 fn bench_baseline(c: &mut Criterion) {

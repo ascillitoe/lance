@@ -6,6 +6,8 @@ use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Allocates error on the heap and then places `e` into it.
+#[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
     Box::new(e)
 }
@@ -84,6 +86,23 @@ pub enum Error {
     Cloned { message: String, location: Location },
     #[snafu(display("Query Execution error: {message}, {location}"))]
     Execution { message: String, location: Location },
+    #[snafu(display("Ref is invalid: {message}"))]
+    InvalidRef { message: String },
+    #[snafu(display("Ref conflict error: {message}"))]
+    RefConflict { message: String },
+    #[snafu(display("Ref not found error: {message}"))]
+    RefNotFound { message: String },
+    #[snafu(display("Cleanup error: {message}"))]
+    Cleanup { message: String },
+    #[snafu(display("Version not found error: {message}"))]
+    VersionNotFound { message: String },
+    #[snafu(display("Version conflict error: {message}"))]
+    VersionConflict {
+        message: String,
+        major_version: u16,
+        minor_version: u16,
+        location: Location,
+    },
 }
 
 impl Error {
@@ -107,10 +126,26 @@ impl Error {
             location,
         }
     }
+
     pub fn io(message: impl Into<String>, location: Location) -> Self {
         let message: String = message.into();
         Self::IO {
             source: message.into(),
+            location,
+        }
+    }
+
+    pub fn version_conflict(
+        message: impl Into<String>,
+        major_version: u16,
+        minor_version: u16,
+        location: Location,
+    ) -> Self {
+        let message: String = message.into();
+        Self::VersionConflict {
+            message,
+            major_version,
+            minor_version,
             location,
         }
     }
@@ -127,6 +162,9 @@ impl ToSnafuLocation for std::panic::Location<'static> {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub type ArrowResult<T> = std::result::Result<T, ArrowError>;
+#[cfg(feature = "datafusion")]
+pub type DataFusionResult<T> = std::result::Result<T, datafusion_common::DataFusionError>;
 
 impl From<ArrowError> for Error {
     #[track_caller]
@@ -181,6 +219,16 @@ impl From<prost::DecodeError> for Error {
 impl From<prost::EncodeError> for Error {
     #[track_caller]
     fn from(e: prost::EncodeError) -> Self {
+        Self::IO {
+            source: box_error(e),
+            location: std::panic::Location::caller().to_snafu_location(),
+        }
+    }
+}
+
+impl From<prost::UnknownEnumValue> for Error {
+    #[track_caller]
+    fn from(e: prost::UnknownEnumValue) -> Self {
         Self::IO {
             source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),
@@ -283,9 +331,34 @@ impl From<Error> for datafusion_common::DataFusionError {
 impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+        let location = std::panic::Location::caller().to_snafu_location();
+        match e {
+            datafusion_common::DataFusionError::SQL(..)
+            | datafusion_common::DataFusionError::Plan(..)
+            | datafusion_common::DataFusionError::Configuration(..) => Self::InvalidInput {
+                source: box_error(e),
+                location,
+            },
+            datafusion_common::DataFusionError::SchemaError(..) => Self::Schema {
+                message: e.to_string(),
+                location,
+            },
+            datafusion_common::DataFusionError::ArrowError(..) => Self::Arrow {
+                message: e.to_string(),
+                location,
+            },
+            datafusion_common::DataFusionError::NotImplemented(..) => Self::NotSupported {
+                source: box_error(e),
+                location,
+            },
+            datafusion_common::DataFusionError::Execution(..) => Self::Execution {
+                message: e.to_string(),
+                location,
+            },
+            _ => Self::IO {
+                source: box_error(e),
+                location,
+            },
         }
     }
 }

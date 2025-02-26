@@ -10,7 +10,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::error::{Error, Result};
 use lance_io::stream::RecordBatchStream;
@@ -32,10 +32,10 @@ pub struct IvfBuildParams {
 
     /// Precomputed partitions file (row_id -> partition_id)
     /// mutually exclusive with `precomputed_shuffle_buffers`
-    pub precomputed_partitons_file: Option<String>,
+    pub precomputed_partitions_file: Option<String>,
 
     /// Precomputed shuffle buffers (row_id -> partition_id, pq_code)
-    /// mutually exclusive with `precomputed_partitons_file`
+    /// mutually exclusive with `precomputed_partitions_file`
     /// requires `centroids` to be set
     ///
     /// The input is expected to be (/dir/to/buffers, [buffer1.lance, buffer2.lance, ...])
@@ -47,6 +47,9 @@ pub struct IvfBuildParams {
 
     /// Use residual vectors to build sub-vector.
     pub use_residual: bool,
+
+    /// Storage options used to load precomputed partitions.
+    pub storage_options: Option<HashMap<String, String>>,
 }
 
 impl Default for IvfBuildParams {
@@ -56,11 +59,12 @@ impl Default for IvfBuildParams {
             max_iters: 50,
             centroids: None,
             sample_rate: 256, // See faiss
-            precomputed_partitons_file: None,
+            precomputed_partitions_file: None,
             precomputed_shuffle_buffers: None,
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,
             use_residual: true,
+            storage_options: None,
         }
     }
 }

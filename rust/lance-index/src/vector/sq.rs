@@ -4,16 +4,22 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
+use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 
+use arrow_schema::DataType;
+use builder::SQBuildParams;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::*;
 use lance_core::{Error, Result};
+use lance_linalg::distance::DistanceType;
 use num_traits::*;
-use snafu::{location, Location};
+use snafu::location;
+use storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage, SQ_METADATA_KEY};
 
-use super::quantizer::Quantizer;
+use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
+use super::SQ_CODE_COLUMN;
 
 pub mod builder;
 pub mod storage;
@@ -113,7 +119,7 @@ impl ScalarQuantizer {
             .as_slice();
 
         // TODO: support SQ4
-        let builder: Vec<u8> = scale_to_u8::<T>(data, self.bounds.clone());
+        let builder: Vec<u8> = scale_to_u8::<T>(data, &self.bounds);
 
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
             UInt8Array::from(builder),
@@ -144,7 +150,89 @@ impl TryFrom<Quantizer> for ScalarQuantizer {
     }
 }
 
-pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: Range<f64>) -> Vec<u8> {
+impl Quantization for ScalarQuantizer {
+    type BuildParams = SQBuildParams;
+    type Metadata = ScalarQuantizationMetadata;
+    type Storage = ScalarQuantizationStorage;
+
+    fn build(data: &dyn Array, _: DistanceType, params: &Self::BuildParams) -> Result<Self> {
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "SQ builder: input is not a FixedSizeList: {}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
+
+        match fsl.value_type() {
+            DataType::Float16 => {
+                quantizer.update_bounds::<Float16Type>(fsl)?;
+            }
+            DataType::Float32 => {
+                quantizer.update_bounds::<Float32Type>(fsl)?;
+            }
+            DataType::Float64 => {
+                quantizer.update_bounds::<Float64Type>(fsl)?;
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!("SQ builder: unsupported data type: {}", fsl.value_type()),
+                    location: location!(),
+                })
+            }
+        }
+
+        Ok(quantizer)
+    }
+
+    fn code_dim(&self) -> usize {
+        self.dim
+    }
+
+    fn column(&self) -> &'static str {
+        SQ_CODE_COLUMN
+    }
+
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        match vectors.as_fixed_size_list().value_type() {
+            DataType::Float16 => self.transform::<Float16Type>(vectors),
+            DataType::Float32 => self.transform::<Float32Type>(vectors),
+            DataType::Float64 => self.transform::<Float64Type>(vectors),
+            value_type => Err(Error::invalid_input(
+                format!("unsupported data type {} for scalar quantizer", value_type),
+                location!(),
+            )),
+        }
+    }
+
+    fn metadata_key() -> &'static str {
+        SQ_METADATA_KEY
+    }
+
+    fn quantization_type() -> QuantizationType {
+        QuantizationType::Scalar
+    }
+
+    fn metadata(&self, _: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(ScalarQuantizationMetadata {
+            dim: self.dim,
+            num_bits: self.num_bits(),
+            bounds: self.bounds(),
+        })?)
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, _: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::Scalar(Self::with_bounds(
+            metadata.num_bits,
+            metadata.dim,
+            metadata.bounds.clone(),
+        )))
+    }
+}
+
+pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: &Range<f64>) -> Vec<u8> {
     let range = bounds.end - bounds.start;
     values
         .iter()
@@ -159,6 +247,16 @@ pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: Range
                     .unwrap(),
             }
         })
+        .collect_vec()
+}
+
+pub(crate) fn inverse_scalar_dist(
+    values: impl Iterator<Item = f32>,
+    bounds: &Range<f64>,
+) -> Vec<f32> {
+    let range = (bounds.end - bounds.start) as f32;
+    values
+        .map(|v| v * range.powi(2) / 255.0.powi(2))
         .collect_vec()
 }
 #[cfg(test)]

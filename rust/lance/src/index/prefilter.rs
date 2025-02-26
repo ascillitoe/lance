@@ -6,6 +6,7 @@
 //! Based on the query, we might have information about which fragment ids and
 //! row ids can be excluded from the search.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,10 +18,13 @@ use futures::stream;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::Fragment;
 use lance_table::format::Index;
+use lance_table::rowids::RowIdSequence;
 use roaring::RoaringBitmap;
 use tokio::join;
 use tracing::instrument;
@@ -47,7 +51,7 @@ pub struct DatasetPreFilter {
     pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowIdMask>>>>,
     pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
     // When the tasks are finished this is the combined filter
-    pub(super) final_mask: Mutex<OnceCell<RowIdMask>>,
+    pub(super) final_mask: Mutex<OnceCell<Arc<RowIdMask>>>,
 }
 
 impl DatasetPreFilter {
@@ -65,7 +69,7 @@ impl DatasetPreFilter {
             });
         }
         let deleted_ids =
-            Self::create_deletion_mask(dataset.clone(), fragments).map(SharedPrerequisite::spawn);
+            Self::create_deletion_mask(dataset, fragments).map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
         Self {
@@ -100,8 +104,8 @@ impl DatasetPreFilter {
         })
         .collect::<Vec<_>>()
         .await;
-        let mut frag_id_deletion_vectors =
-            stream::iter(frag_id_deletion_vectors).buffer_unordered(num_cpus::get());
+        let mut frag_id_deletion_vectors = stream::iter(frag_id_deletion_vectors)
+            .buffer_unordered(dataset.object_store.io_parallelism());
 
         let mut deleted_ids = RowIdTreeMap::new();
         while let Some((id, deletion_vector)) = frag_id_deletion_vectors.try_next().await? {
@@ -119,49 +123,59 @@ impl DatasetPreFilter {
         // This can only be computed as an allow list, since we have no idea
         // what the row ids were in the missing fragments.
 
-        // For each fragment, compute which row ids are still in use.
-        let dataset_ref = dataset.as_ref();
+        let path = dataset
+            .base
+            .child(format!("row_id_mask{}", dataset.manifest().version));
 
-        let row_ids_and_deletions = stream::iter(dataset.get_fragments())
-            .map(|frag| async move {
-                let row_ids = load_row_id_sequence(dataset_ref, frag.metadata());
-                let deletion_vector = frag.get_deletion_vector();
-                let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
-                Ok::<_, crate::Error>((row_ids?, deletion_vector?))
-            })
-            .buffer_unordered(10)
-            .try_collect::<Vec<_>>()
-            .await?;
+        let session = dataset.session();
 
-        // The process of computing the final mask is CPU-bound, so we spawn it
-        // on a blocking thread.
-        let allow_list = tokio::task::spawn_blocking(move || {
-            row_ids_and_deletions.into_iter().fold(
-                RowIdTreeMap::new(),
-                |mut allow_list, (row_ids, deletion_vector)| {
-                    let row_ids = if let Some(deletion_vector) = deletion_vector {
-                        // We have to mask the row ids
-                        row_ids.as_ref().iter().enumerate().fold(
+        async fn load_row_ids_and_deletions(
+            dataset: &Dataset,
+        ) -> Result<Vec<(Arc<RowIdSequence>, Option<Arc<DeletionVector>>)>> {
+            stream::iter(dataset.get_fragments())
+                .map(|frag| async move {
+                    let row_ids = load_row_id_sequence(dataset, frag.metadata());
+                    let deletion_vector = frag.get_deletion_vector();
+                    let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
+                    Ok::<_, crate::Error>((row_ids?, deletion_vector?))
+                })
+                .buffer_unordered(dataset.object_store().io_parallelism())
+                .try_collect::<Vec<_>>()
+                .await
+        }
+
+        session
+            .file_metadata_cache
+            .get_or_insert(&path, move |_| {
+                let dataset = dataset.clone();
+                async move {
+                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset).await?;
+
+                    // The process of computing the final mask is CPU-bound, so we spawn it
+                    // on a blocking thread.
+                    let allow_list = spawn_cpu(move || {
+                        Ok(row_ids_and_deletions.into_iter().fold(
                             RowIdTreeMap::new(),
-                            |mut allow_list, (idx, row_id)| {
-                                if !deletion_vector.contains(idx as u32) {
-                                    allow_list.insert(row_id);
-                                }
+                            |mut allow_list, (row_ids, deletion_vector)| {
+                                let seq = if let Some(deletion_vector) = deletion_vector {
+                                    let mut row_ids = row_ids.as_ref().clone();
+                                    row_ids.mask(deletion_vector.iter()).unwrap();
+                                    Cow::Owned(row_ids)
+                                } else {
+                                    Cow::Borrowed(row_ids.as_ref())
+                                };
+                                let treemap = RowIdTreeMap::from(seq.as_ref());
+                                allow_list |= treemap;
                                 allow_list
                             },
-                        )
-                    } else {
-                        // Can do a direct translation
-                        RowIdTreeMap::from(row_ids.as_ref())
-                    };
-                    allow_list |= row_ids;
-                    allow_list
-                },
-            )
-        })
-        .await?;
+                        ))
+                    })
+                    .await?;
 
-        Ok(Arc::new(RowIdMask::from_allowed(allow_list)))
+                    Ok(RowIdMask::from_allowed(allow_list))
+                }
+            })
+            .await
     }
 
     /// Creates a task to load mask to filter out deleted rows.
@@ -217,6 +231,7 @@ impl PreFilter for DatasetPreFilter {
     /// search is running.  When you are ready to use the prefilter you
     /// must first call this method to ensure it is fully loaded.  This
     /// allows `filter_row_ids` to be a synchronous method.
+    #[instrument(level = "debug", skip(self))]
     async fn wait_for_ready(&self) -> Result<()> {
         if let Some(filtered_ids) = &self.filtered_ids {
             filtered_ids.wait_ready().await?;
@@ -233,7 +248,7 @@ impl PreFilter for DatasetPreFilter {
             if let Some(deleted_ids) = &self.deleted_ids {
                 combined = combined & (*deleted_ids.get_ready()).clone();
             }
-            combined
+            Arc::new(combined)
         });
 
         Ok(())
@@ -241,6 +256,16 @@ impl PreFilter for DatasetPreFilter {
 
     fn is_empty(&self) -> bool {
         self.deleted_ids.is_none() && self.filtered_ids.is_none()
+    }
+
+    /// Get the row id mask for this prefilter
+    fn mask(&self) -> Arc<RowIdMask> {
+        self.final_mask
+            .lock()
+            .unwrap()
+            .get()
+            .expect("mask called without call to wait_for_ready")
+            .clone()
     }
 
     /// Check whether a slice of row ids should be included in a query.
@@ -251,11 +276,7 @@ impl PreFilter for DatasetPreFilter {
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        let final_mask = self.final_mask.lock().unwrap();
-        final_mask
-            .get()
-            .expect("filter_row_ids called without call to wait_for_ready")
-            .selected_indices(row_ids)
+        self.mask().selected_indices(row_ids)
     }
 }
 

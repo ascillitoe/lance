@@ -12,7 +12,8 @@ use arrow_array::{
     RecordBatch,
 };
 use arrow_schema::{DataType, Field};
-use snafu::{location, Location};
+use snafu::location;
+use tracing::instrument;
 
 use crate::vector::transform::Transformer;
 
@@ -48,6 +49,7 @@ impl Debug for SQTransformer {
 }
 
 impl Transformer for SQTransformer {
+    #[instrument(name = "SQTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let input = batch
             .column_by_name(&self.input_column)

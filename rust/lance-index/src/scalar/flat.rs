@@ -14,13 +14,15 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{Index, IndexType};
 
-use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex, ScalarQuery};
+use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex};
+use super::{AnyQuery, SargableQuery};
 
 /// A flat index is just a batch of value/row-id pairs
 ///
@@ -31,6 +33,7 @@ use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex, ScalarQuery};
 #[derive(Debug)]
 pub struct FlatIndex {
     data: Arc<RecordBatch>,
+    has_nulls: bool,
 }
 
 impl DeepSizeOf for FlatIndex {
@@ -73,7 +76,7 @@ fn remap_batch(batch: RecordBatch, mapping: &HashMap<u64, Option<u64>>) -> Resul
     );
     let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
     Ok(RecordBatch::try_new(
-        batch.schema().clone(),
+        batch.schema(),
         vec![new_vals, new_ids],
     )?)
 }
@@ -130,8 +133,10 @@ impl BTreeSubIndex for FlatIndexMetadata {
     }
 
     async fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>> {
+        let has_nulls = serialized.column(0).null_count() > 0;
         Ok(Arc::new(FlatIndex {
             data: Arc::new(serialized),
+            has_nulls,
         }))
     }
 
@@ -180,7 +185,7 @@ impl Index for FlatIndex {
             .ids()
             .as_primitive::<UInt64Type>()
             .iter()
-            .map(|row_id| RowAddress::new_from_id(row_id.unwrap()).fragment_id())
+            .map(|row_id| RowAddress::from(row_id.unwrap()).fragment_id())
             .collect::<Vec<_>>();
         frag_ids.sort();
         frag_ids.dedup();
@@ -190,16 +195,27 @@ impl Index for FlatIndex {
 
 #[async_trait]
 impl ScalarIndex for FlatIndex {
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
-        let predicate = match query {
-            ScalarQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?,
-            ScalarQuery::IsNull() => arrow::compute::is_null(self.values())?,
-            ScalarQuery::IsIn(values) => {
+        let mut predicate = match query {
+            SargableQuery::Equals(value) => {
+                if value.is_null() {
+                    arrow::compute::is_null(self.values())?
+                } else {
+                    arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?
+                }
+            }
+            SargableQuery::IsNull() => arrow::compute::is_null(self.values())?,
+            SargableQuery::IsIn(values) => {
+                let mut has_null = false;
                 let choices = values
                     .iter()
-                    .map(|val| lit(val.clone()))
+                    .map(|val| {
+                        has_null |= val.is_null();
+                        lit(val.clone())
+                    })
                     .collect::<Vec<_>>();
                 let in_list_expr = in_list(
                     Arc::new(Column::new("values", 0)),
@@ -208,14 +224,22 @@ impl ScalarIndex for FlatIndex {
                     &self.data.schema(),
                 )?;
                 let result_col = in_list_expr.evaluate(&self.data)?;
-                result_col
+                let predicate = result_col
                     .into_array(self.data.num_rows())?
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .expect("InList evaluation should return boolean array")
-                    .clone()
+                    .clone();
+
+                // Arrow's in_list does not handle nulls so we need to join them in here if user asked for them
+                if has_null && self.has_nulls {
+                    let nulls = arrow::compute::is_null(self.values())?;
+                    arrow::compute::or(&predicate, &nulls)?
+                } else {
+                    predicate
+                }
             }
-            ScalarQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
+            SargableQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
                 (Bound::Unbounded, Bound::Unbounded) => {
                     panic!("Scalar range query received with no upper or lower bound")
                 }
@@ -248,12 +272,23 @@ impl ScalarIndex for FlatIndex {
                     &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
                 )?,
             },
+            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
+                "full text search is not supported for flat index, build a inverted index for it",
+                location!(),
+            )),
         };
-        Ok(arrow_select::filter::filter(self.ids(), &predicate)?
+        if self.has_nulls && matches!(query, SargableQuery::Range(_, _)) {
+            // Arrow's comparison kernels do not return false for nulls.  They consider nulls to
+            // be less than any value.  So we need to filter out the nulls manually.
+            let valid_values = arrow::compute::is_not_null(self.values())?;
+            predicate = arrow::compute::and(&valid_values, &predicate)?;
+        }
+        let matching_ids = arrow_select::filter::filter(self.ids(), &predicate)?;
+        let matching_ids = matching_ids
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .expect("Result of arrow_select::filter::filter did not match input type")
-            .clone())
+            .expect("Result of arrow_select::filter::filter did not match input type");
+        Ok(RowIdTreeMap::from_iter(matching_ids.values()))
     }
 
     // Note that there is no write/train method for flat index at the moment and so it isn't
@@ -261,9 +296,12 @@ impl ScalarIndex for FlatIndex {
     // data as a single batch named data.lance
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
         let batches = store.open_index_file("data.lance").await?;
-        let batch = batches.read_record_batch(0).await?;
+        let num_rows = batches.num_rows();
+        let batch = batches.read_range(0..num_rows, None).await?;
+        let has_nulls = batch.column(0).null_count() > 0;
         Ok(Arc::new(Self {
             data: Arc::new(batch),
+            has_nulls,
         }))
     }
 
@@ -311,27 +349,28 @@ mod tests {
 
         FlatIndex {
             data: Arc::new(batch),
+            has_nulls: false,
         }
     }
 
-    async fn check_index(query: &ScalarQuery, expected: &[u64]) {
+    async fn check_index(query: &SargableQuery, expected: &[u64]) {
         let index = example_index();
         let actual = index.search(query).await.unwrap();
-        let expected = UInt64Array::from_iter_values(expected.iter().copied());
+        let expected = RowIdTreeMap::from_iter(expected);
         assert_eq!(actual, expected);
     }
 
     #[tokio::test]
     async fn test_equality() {
-        check_index(&ScalarQuery::Equals(ScalarValue::from(100)), &[0]).await;
-        check_index(&ScalarQuery::Equals(ScalarValue::from(10)), &[5]).await;
-        check_index(&ScalarQuery::Equals(ScalarValue::from(5)), &[]).await;
+        check_index(&SargableQuery::Equals(ScalarValue::from(100)), &[0]).await;
+        check_index(&SargableQuery::Equals(ScalarValue::from(10)), &[5]).await;
+        check_index(&SargableQuery::Equals(ScalarValue::from(5)), &[]).await;
     }
 
     #[tokio::test]
     async fn test_range() {
         check_index(
-            &ScalarQuery::Range(
+            &SargableQuery::Range(
                 Bound::Included(ScalarValue::from(100)),
                 Bound::Excluded(ScalarValue::from(1234)),
             ),
@@ -339,17 +378,17 @@ mod tests {
         )
         .await;
         check_index(
-            &ScalarQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::from(1000))),
+            &SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::from(1000))),
             &[5, 0],
         )
         .await;
         check_index(
-            &ScalarQuery::Range(Bound::Included(ScalarValue::from(0)), Bound::Unbounded),
+            &SargableQuery::Range(Bound::Included(ScalarValue::from(0)), Bound::Unbounded),
             &[5, 0, 3, 100],
         )
         .await;
         check_index(
-            &ScalarQuery::Range(Bound::Included(ScalarValue::from(100000)), Bound::Unbounded),
+            &SargableQuery::Range(Bound::Included(ScalarValue::from(100000)), Bound::Unbounded),
             &[],
         )
         .await;
@@ -358,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_in() {
         check_index(
-            &ScalarQuery::IsIn(vec![
+            &SargableQuery::IsIn(vec![
                 ScalarValue::from(100),
                 ScalarValue::from(1234),
                 ScalarValue::from(3000),

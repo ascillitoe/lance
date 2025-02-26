@@ -16,7 +16,8 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
-use snafu::{location, Location, ResultExt};
+use snafu::{location, ResultExt};
+use tracing::instrument;
 
 use crate::format::{DeletionFile, DeletionFileType, Fragment};
 
@@ -87,7 +88,7 @@ pub async fn write_deletion_file(
                 // Drop writer so out is no longer borrowed.
             }
 
-            object_store.inner.put(&path, out.into()).await?;
+            object_store.put(&path, &out).await?;
 
             Ok(Some(deletion_file))
         }
@@ -104,7 +105,7 @@ pub async fn write_deletion_file(
             let mut out: Vec<u8> = Vec::new();
             bitmap.serialize_into(&mut out)?;
 
-            object_store.inner.put(&path, out.into()).await?;
+            object_store.put(&path, &out).await?;
 
             Ok(Some(deletion_file))
         }
@@ -116,6 +117,7 @@ pub async fn write_deletion_file(
 /// Returns the deletion vector if one was present. Otherwise returns `Ok(None)`.
 ///
 /// Will return an error if the file is present but invalid.
+#[instrument(level = "debug", skip_all)]
 pub async fn read_deletion_file(
     base: &Path,
     fragment: &Fragment,
@@ -129,12 +131,15 @@ pub async fn read_deletion_file(
         DeletionFileType::Array => {
             let path = deletion_file_path(base, fragment.id, deletion_file);
 
-            let data = object_store.inner.get(&path).await?.bytes().await?;
+            let data = object_store.read_one_all(&path).await?;
             let data = std::io::Cursor::new(data);
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
                 .collect::<std::result::Result<_, ArrowError>>()
                 .map_err(box_error)
-                .context(CorruptFileSnafu { path: path.clone() })?;
+                .context(CorruptFileSnafu {
+                    path: path.clone(),
+                    location: location!(),
+                })?;
 
             if batches.len() != 1 {
                 return Err(Error::corrupt_file(
@@ -183,11 +188,14 @@ pub async fn read_deletion_file(
         DeletionFileType::Bitmap => {
             let path = deletion_file_path(base, fragment.id, deletion_file);
 
-            let data = object_store.inner.get(&path).await?.bytes().await?;
+            let data = object_store.read_one_all(&path).await?;
             let reader = data.reader();
             let bitmap = RoaringBitmap::deserialize_from(reader)
                 .map_err(box_error)
-                .context(CorruptFileSnafu { path })?;
+                .context(CorruptFileSnafu {
+                    path,
+                    location: location!(),
+                })?;
 
             Ok(Some(DeletionVector::Bitmap(bitmap)))
         }

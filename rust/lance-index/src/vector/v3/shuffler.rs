@@ -8,18 +8,30 @@ use std::sync::Arc;
 
 use arrow::{array::AsArray, compute::sort_to_indices};
 use arrow_array::{RecordBatch, UInt32Array};
-use future::join_all;
+use arrow_schema::Schema;
+use future::try_join_all;
 use futures::prelude::*;
-use lance_arrow::RecordBatchExt;
-use lance_core::{utils::tokio::spawn_cpu, Error, Result};
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
-use lance_file::v2::{reader::FileReader, writer::FileWriter};
+use itertools::Itertools;
+use lance_arrow::{RecordBatchExt, SchemaExt};
+use lance_core::{
+    cache::FileMetadataCache,
+    utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+    Error, Result,
+};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2::reader::ReaderProjection;
+use lance_file::v2::{
+    reader::{FileReader, FileReaderOptions},
+    writer::FileWriter,
+};
 use lance_io::{
     object_store::ObjectStore,
-    scheduler::ScanScheduler,
+    scheduler::{ScanScheduler, SchedulerConfig},
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
 };
 use object_store::path::Path;
+use snafu::location;
+use tokio::sync::Mutex;
 
 use crate::vector::PART_ID_COLUMN;
 
@@ -28,7 +40,7 @@ use crate::vector::PART_ID_COLUMN;
 pub trait ShuffleReader: Send + Sync {
     /// Read a partition by partition_id
     /// will return Ok(None) if partition_size is 0
-    /// check reader.partiton_size(partition_id) before calling this function
+    /// check reader.partition_size(partition_id) before calling this function
     async fn read_partition(
         &self,
         partition_id: usize,
@@ -81,6 +93,10 @@ impl Shuffler for IvfShuffler {
         &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
     ) -> Result<Box<dyn ShuffleReader>> {
+        if self.num_partitions == 1 {
+            return Ok(Box::new(SinglePartitionReader::new(data)));
+        }
+
         let mut writers: Vec<FileWriter> = vec![];
         let mut partition_sizes = vec![0; self.num_partitions];
         let mut first_pass = true;
@@ -123,7 +139,7 @@ impl Shuffler for IvfShuffler {
                     Ok::<Vec<Vec<RecordBatch>>, Error>(partition_buffers)
                 })
             })
-            .buffered(num_cpus::get());
+            .buffered(get_num_compute_intensive_cpus());
 
         // part_id:           |       0        |       1        |       3        |
         // partition_buffers: |[batch,batch,..]|[batch,batch,..]|[batch,batch,..]|
@@ -159,7 +175,6 @@ impl Shuffler for IvfShuffler {
                             let writer = object_store.create(&part_path).await?;
                             FileWriter::try_new(
                                 writer,
-                                part_path.to_string(),
                                 lance_core::datatypes::Schema::try_from(schema.as_ref())?,
                                 Default::default(),
                             )
@@ -181,10 +196,7 @@ impl Shuffler for IvfShuffler {
                     partition_sizes[part_id] += batches.iter().map(|b| b.num_rows()).sum::<usize>();
                     futs.push(writer.write_batches(batches.iter()));
                 }
-                join_all(futs)
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>>>()?;
+                try_join_all(futs).await?;
 
                 partition_buffers.iter_mut().for_each(|b| b.clear());
             }
@@ -224,7 +236,8 @@ impl IvfShufflerReader {
         output_dir: Path,
         partition_sizes: Vec<usize>,
     ) -> Self {
-        let scheduler = ScanScheduler::new(object_store, 32);
+        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+        let scheduler = ScanScheduler::new(object_store, scheduler_config);
         Self {
             scheduler,
             output_dir,
@@ -244,17 +257,40 @@ impl ShuffleReader for IvfShufflerReader {
         let reader = FileReader::try_open(
             self.scheduler.open_file(&partition_path).await?,
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderPlugins>::default(),
+            &FileMetadataCache::no_cache(),
+            FileReaderOptions::default(),
         )
         .await?;
-        let schema = reader.schema().as_ref().into();
-
+        let schema: Schema = reader.schema().as_ref().into();
+        let projection = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, f)| {
+                if f.name() != PART_ID_COLUMN {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = schema.project(&projection)?;
+        let projection = ReaderProjection::from_column_names(
+            reader.schema().as_ref(),
+            &schema
+                .field_names()
+                .into_iter()
+                .map(|s| s.as_ref())
+                .collect_vec(),
+        )?;
         Ok(Some(Box::new(RecordBatchStreamAdapter::new(
             Arc::new(schema),
-            reader.read_stream(
+            reader.read_stream_projected(
                 lance_io::ReadBatchParams::RangeFull,
                 4096,
                 16,
+                projection,
                 FilterExpression::no_filter(),
             )?,
         ))))
@@ -262,5 +298,41 @@ impl ShuffleReader for IvfShufflerReader {
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
         Ok(self.partition_sizes[partition_id])
+    }
+}
+
+pub struct SinglePartitionReader {
+    data: Mutex<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>,
+}
+
+impl SinglePartitionReader {
+    pub fn new(data: Box<dyn RecordBatchStream + Unpin + 'static>) -> Self {
+        Self {
+            data: Mutex::new(Some(data)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ShuffleReader for SinglePartitionReader {
+    async fn read_partition(
+        &self,
+        _partition_id: usize,
+    ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
+        let mut data = self.data.lock().await;
+        match data.as_mut() {
+            Some(_) => Ok(data.take()),
+            None => Err(Error::Internal {
+                message: "the partition has been read and consumed".to_string(),
+                location: location!(),
+            }),
+        }
+    }
+
+    fn partition_size(&self, _partition_id: usize) -> Result<usize> {
+        // we don't really care about the partition size
+        // it's used for determining the order of building the index and skipping empty partitions
+        // so we just return 1 here
+        Ok(1)
     }
 }

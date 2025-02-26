@@ -10,7 +10,8 @@ use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::Field;
-use snafu::{location, Location};
+use lance_table::utils::LanceIteratorExtension;
+use snafu::location;
 use tracing::instrument;
 
 use lance_arrow::RecordBatchExt;
@@ -22,9 +23,10 @@ use crate::vector::transform::Transformer;
 
 use super::PART_ID_COLUMN;
 
-/// Ivf Transformer
+/// PartitionTransformer
 ///
-/// It transforms a Vector column, specified by the input data, into a column of partition IDs.
+/// It computes the partition ID for each row from the input batch,
+/// and adds the partition ID as a new column to the batch.
 ///
 /// If the partition ID ("__ivf_part_id") column is already present in the Batch,
 /// this transform is a Noop.
@@ -53,7 +55,7 @@ impl PartitionTransformer {
 
     /// Compute the partition for each row in the input Matrix.
     ///
-    #[instrument(level = "debug", skip(data))]
+    #[instrument(level = "debug", skip_all)]
     pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
         compute_partitions_arrow_array(&self.centroids, data, self.distance_type)
             .expect("failed to compute partitions")
@@ -61,6 +63,7 @@ impl PartitionTransformer {
     }
 }
 impl Transformer for PartitionTransformer {
+    #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {
             // If the partition ID column is already present, we don't need to compute it again.
@@ -76,6 +79,7 @@ impl Transformer for PartitionTransformer {
                     ),
                     location: location!(),
                 })?;
+
         let fsl = arr
             .as_fixed_size_list_opt()
             .ok_or_else(|| lance_core::Error::Index {
@@ -120,11 +124,14 @@ impl PartitionFilter {
                     None
                 }
             })
+            // in most cases, no partition will be filtered out.
+            .exact_size(partition_ids.len())
             .collect()
     }
 }
 
 impl Transformer for PartitionFilter {
+    #[instrument(name = "PartitionFilter::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         // TODO: use datafusion execute?
         let arr = batch

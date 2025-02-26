@@ -1,34 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use core::panic;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 
+use arrow_data::ArrayData;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::stream::FuturesUnordered;
+use futures::stream::FuturesOrdered;
 use futures::StreamExt;
-use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::datatypes::{Field, Schema as LanceSchema};
+use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
+use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
-    BatchEncoder, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch, EncodedPage, FieldEncoder,
-    FieldEncodingStrategy,
+    default_encoding_strategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
+    EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
 };
+use lance_encoding::repdef::RepDefBuilder;
+use lance_encoding::version::LanceFileVersion;
+use lance_io::object_store::ObjectStore;
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
 use log::debug;
+use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
+use tracing::instrument;
 
 use crate::datatypes::FieldsWithMeta;
 use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::format::MAGIC;
-use crate::format::MAJOR_VERSION;
-use crate::format::MINOR_VERSION_NEXT;
+
+/// Pages buffers are aligned to 64 bytes
+pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
+const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
@@ -47,6 +59,12 @@ pub struct FileWriterOptions {
     /// The default will use 8MiB per column which should be reasonable for most cases.
     // TODO: Do we need to be able to set this on a per-column basis?
     pub data_cache_bytes: Option<u64>,
+    /// A hint to indicate the max size of a page
+    ///
+    /// This hint can't always be respected.  A single value could be larger than this value
+    /// and we never slice single values.  In addition, there are some cases where it can be
+    /// difficult to know size up-front and so we might not be able to respect this value.
+    pub max_page_bytes: Option<u64>,
     /// The file writer buffers columns until enough data has arrived to flush a page
     /// to disk.
     ///
@@ -66,18 +84,25 @@ pub struct FileWriterOptions {
     /// of that batch's data has been written to disk)
     pub keep_original_array: Option<bool>,
     pub encoding_strategy: Option<Arc<dyn FieldEncodingStrategy>>,
+    /// The format version to use when writing the file
+    ///
+    /// This controls which encodings will be used when encoding the data.  Newer
+    /// versions may have more efficient encodings.  However, newer format versions will
+    /// require more up-to-date readers to read the data.
+    pub format_version: Option<LanceFileVersion>,
 }
 
 pub struct FileWriter {
     writer: ObjectWriter,
-    path: String,
-    schema: LanceSchema,
+    schema: Option<LanceSchema>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
-    field_id_to_column_indices: Vec<(i32, i32)>,
+    field_id_to_column_indices: Vec<(u32, u32)>,
     num_columns: u32,
     rows_written: u64,
     global_buffers: Vec<(u64, u64)>,
+    schema_metadata: HashMap<String, String>,
+    options: FileWriterOptions,
 }
 
 fn initial_column_metadata() -> pbfile::ColumnMetadata {
@@ -90,73 +115,79 @@ fn initial_column_metadata() -> pbfile::ColumnMetadata {
 }
 
 impl FileWriter {
-    /// Create a new FileWriter
+    /// Create a new FileWriter with a desired output schema
     pub fn try_new(
         object_writer: ObjectWriter,
-        path: String,
         schema: LanceSchema,
         options: FileWriterOptions,
     ) -> Result<Self> {
-        let cache_bytes_per_column = if let Some(data_cache_bytes) = options.data_cache_bytes {
-            data_cache_bytes / schema.fields.len() as u64
-        } else {
-            8 * 1024 * 1024
-        };
+        let mut writer = Self::new_lazy(object_writer, options);
+        writer.initialize(schema)?;
+        Ok(writer)
+    }
 
-        schema.validate()?;
-
-        let keep_original_array = options.keep_original_array.unwrap_or(false);
-        let encoding_strategy = options
-            .encoding_strategy
-            .unwrap_or_else(|| Arc::new(CoreFieldEncodingStrategy::default()));
-
-        let encoder = BatchEncoder::try_new(
-            &schema,
-            encoding_strategy.as_ref(),
-            cache_bytes_per_column,
-            keep_original_array,
-        )?;
-        let num_columns = encoder.num_columns();
-
-        let column_writers = encoder.field_encoders;
-        let column_metadata = vec![initial_column_metadata(); num_columns as usize];
-
-        Ok(Self {
+    /// Create a new FileWriter without a desired output schema
+    ///
+    /// The output schema will be set based on the first batch of data to arrive.
+    /// If no data arrives and the writer is finished then the write will fail.
+    pub fn new_lazy(object_writer: ObjectWriter, options: FileWriterOptions) -> Self {
+        Self {
             writer: object_writer,
-            path,
-            schema,
-            column_writers,
-            column_metadata,
-            num_columns,
+            schema: None,
+            column_writers: Vec::new(),
+            column_metadata: Vec::new(),
+            num_columns: 0,
             rows_written: 0,
-            field_id_to_column_indices: encoder.field_id_to_column_index,
+            field_id_to_column_indices: Vec::new(),
             global_buffers: Vec::new(),
-        })
+            schema_metadata: HashMap::new(),
+            options,
+        }
+    }
+
+    /// Write a series of record batches to a new file
+    ///
+    /// Returns the number of rows written
+    pub async fn create_file_with_batches(
+        store: &ObjectStore,
+        path: &Path,
+        schema: lance_core::datatypes::Schema,
+        batches: impl Iterator<Item = RecordBatch> + Send,
+        options: FileWriterOptions,
+    ) -> Result<usize> {
+        let writer = store.create(path).await?;
+        let mut writer = Self::try_new(writer, schema, options)?;
+        for batch in batches {
+            writer.write_batch(&batch).await?;
+        }
+        Ok(writer.finish().await? as usize)
+    }
+
+    async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {
+        writer.write_all(buf).await?;
+        let pad_bytes = pad_bytes::<PAGE_BUFFER_ALIGNMENT>(buf.len());
+        writer.write_all(&PAD_BUFFER[..pad_bytes]).await?;
+        Ok(())
+    }
+
+    /// Returns the format version that will be used when writing the file
+    pub fn version(&self) -> LanceFileVersion {
+        self.options.format_version.unwrap_or_default()
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
-        let mut buffers = encoded_page.array.buffers;
-        buffers.sort_by_key(|b| b.index);
+        let buffers = encoded_page.data;
         let mut buffer_offsets = Vec::with_capacity(buffers.len());
         let mut buffer_sizes = Vec::with_capacity(buffers.len());
         for buffer in buffers {
             buffer_offsets.push(self.writer.tell().await? as u64);
-            buffer_sizes.push(
-                buffer
-                    .parts
-                    .iter()
-                    .map(|part| part.len() as u64)
-                    .sum::<u64>(),
-            );
-            // Note: could potentially use write_vectored here but there is no
-            // write_vectored_all and object_store doesn't support it anyways and
-            // buffers won't normally be in *too* many parts so its unlikely to
-            // have much benefit in most cases.
-            for part in &buffer.parts {
-                self.writer.write_all(part).await?;
-            }
+            buffer_sizes.push(buffer.len() as u64);
+            Self::do_write_buffer(&mut self.writer, &buffer).await?;
         }
-        let encoded_encoding = Any::from_msg(&encoded_page.array.encoding)?.encode_to_vec();
+        let encoded_encoding = match encoded_page.description {
+            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
+            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
+        };
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -166,6 +197,7 @@ impl FileWriter {
                 })),
             }),
             length: encoded_page.num_rows,
+            priority: encoded_page.row_number,
         };
         self.column_metadata[encoded_page.column_idx as usize]
             .pages
@@ -173,10 +205,8 @@ impl FileWriter {
         Ok(())
     }
 
-    async fn write_pages(
-        &mut self,
-        mut encoding_tasks: FuturesUnordered<EncodeTask>,
-    ) -> Result<()> {
+    #[instrument(skip_all, level = "debug")]
+    async fn write_pages(&mut self, mut encoding_tasks: FuturesOrdered<EncodeTask>) -> Result<()> {
         // As soon as an encoding task is done we write it.  There is no parallelism
         // needed here because "writing" is really just submitting the buffer to the
         // underlying write scheduler (either the OS or object_store's scheduler for
@@ -208,35 +238,82 @@ impl FileWriter {
         Ok(())
     }
 
-    /// Schedule a batch of data to be written to the file
-    ///
-    /// Note: the future returned by this method may complete before the data has been fully
-    /// flushed to the file (some data may be in the data cache or the I/O cache)
-    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        debug!(
-            "write_batch called with {} bytes of data",
-            batch.get_array_memory_size()
-        );
-        let num_rows = batch.num_rows() as u64;
-        if num_rows == 0 {
-            return Ok(());
+    fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
+        if !field.nullable && arr.null_count() > 0 {
+            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
         }
-        if num_rows > u32::MAX as u64 {
-            return Err(Error::InvalidInput {
-                source: "cannot write Lance files with more than 2^32 rows".into(),
-                location: location!(),
-            });
+
+        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
+            Self::verify_field_nullability(child_arr, child_field)?;
         }
-        self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
-            Some(rows_written) => rows_written,
-            None => {
-                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^32 rows", num_rows, self.rows_written).into(), location: location!() });
-            }
+
+        Ok(())
+    }
+
+    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
+        for (col, field) in batch
+            .columns()
+            .iter()
+            .zip(self.schema.as_ref().unwrap().fields.iter())
+        {
+            Self::verify_field_nullability(&col.to_data(), field)?;
+        }
+        Ok(())
+    }
+
+    fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
+        let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
+            data_cache_bytes / schema.fields.len() as u64
+        } else {
+            8 * 1024 * 1024
         };
-        // First we push each array into its column writer.  This may or may not generate enough
-        // data to trigger an encoding task.  We collect any encoding tasks into a queue.
-        let encoding_tasks = self
-            .schema
+
+        let max_page_bytes = self.options.max_page_bytes.unwrap_or(32 * 1024 * 1024);
+
+        schema.validate()?;
+
+        let keep_original_array = self.options.keep_original_array.unwrap_or(false);
+        let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
+            let version = self.version();
+            default_encoding_strategy(version).into()
+        });
+
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column,
+            max_page_bytes,
+            keep_original_array,
+            buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
+        };
+        let encoder =
+            BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
+        self.num_columns = encoder.num_columns();
+
+        self.column_writers = encoder.field_encoders;
+        self.column_metadata = vec![initial_column_metadata(); self.num_columns as usize];
+        self.field_id_to_column_indices = encoder.field_id_to_column_index;
+        self.schema_metadata
+            .extend(std::mem::take(&mut schema.metadata));
+        self.schema = Some(schema);
+        Ok(())
+    }
+
+    fn ensure_initialized(&mut self, batch: &RecordBatch) -> Result<&LanceSchema> {
+        if self.schema.is_none() {
+            let schema = LanceSchema::try_from(batch.schema().as_ref())?;
+            self.initialize(schema)?;
+        }
+        Ok(self.schema.as_ref().unwrap())
+    }
+
+    #[instrument(skip_all, level = "debug")]
+    fn encode_batch(
+        &mut self,
+        batch: &RecordBatch,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<Vec<EncodeTask>>> {
+        self.schema
+            .as_ref()
+            .unwrap()
             .fields
             .iter()
             .zip(self.column_writers.iter_mut())
@@ -251,13 +328,61 @@ impl FileWriter {
                         .into(),
                         location: location!(),
                     })?;
-                column_writer.maybe_encode(array.clone())
+                let repdef = RepDefBuilder::default();
+                let num_rows = array.len() as u64;
+                column_writer.maybe_encode(
+                    array.clone(),
+                    external_buffers,
+                    repdef,
+                    self.rows_written,
+                    num_rows,
+                )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Schedule a batch of data to be written to the file
+    ///
+    /// Note: the future returned by this method may complete before the data has been fully
+    /// flushed to the file (some data may be in the data cache or the I/O cache)
+    pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        debug!(
+            "write_batch called with {} bytes of data",
+            batch.get_array_memory_size()
+        );
+        self.ensure_initialized(batch)?;
+        self.verify_nullability_constraints(batch)?;
+        let num_rows = batch.num_rows() as u64;
+        if num_rows == 0 {
+            return Ok(());
+        }
+        if num_rows > u32::MAX as u64 {
+            return Err(Error::InvalidInput {
+                source: "cannot write Lance files with more than 2^32 rows".into(),
+                location: location!(),
+            });
+        }
+        // First we push each array into its column writer.  This may or may not generate enough
+        // data to trigger an encoding task.  We collect any encoding tasks into a queue.
+        let mut external_buffers =
+            OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
+        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        // Next, write external buffers
+        for external_buffer in external_buffers.take_buffers() {
+            Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
+        }
+
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
-            .collect::<FuturesUnordered<_>>();
+            .collect::<FuturesOrdered<_>>();
+
+        self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
+            Some(rows_written) => rows_written,
+            None => {
+                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^64 rows", num_rows, self.rows_written).into(), location: location!() });
+            }
+        };
 
         self.write_pages(encoding_tasks).await?;
 
@@ -300,7 +425,9 @@ impl FileWriter {
     }
 
     async fn write_global_buffers(&mut self) -> Result<Vec<(u64, u64)>> {
-        let file_descriptor = Self::make_file_descriptor(&self.schema, self.rows_written)?;
+        let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created", location!()))?;
+        schema.metadata = std::mem::take(&mut self.schema_metadata);
+        let file_descriptor = Self::make_file_descriptor(schema, self.rows_written)?;
         let file_descriptor_bytes = file_descriptor.encode_to_vec();
         let file_descriptor_len = file_descriptor_bytes.len() as u64;
         let file_descriptor_position = self.writer.tell().await? as u64;
@@ -317,7 +444,7 @@ impl FileWriter {
     /// data has been written.  This method allows you to alter the schema metadata.  It
     /// must be called before `finish` is called.
     pub fn add_schema_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.schema.metadata.insert(key.into(), value.into());
+        self.schema_metadata.insert(key.into(), value.into());
     }
 
     /// Adds a global buffer to the file
@@ -328,7 +455,7 @@ impl FileWriter {
     pub async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
         let position = self.writer.tell().await? as u64;
         let len = buffer.len() as u64;
-        self.writer.write_all(&buffer).await?;
+        Self::do_write_buffer(&mut self.writer, &buffer).await?;
         self.global_buffers.push((position, len));
         Ok(self.global_buffers.len() as u32)
     }
@@ -336,7 +463,12 @@ impl FileWriter {
     async fn finish_writers(&mut self) -> Result<()> {
         let mut col_idx = 0;
         for mut writer in std::mem::take(&mut self.column_writers) {
-            let columns = writer.finish().await?;
+            let mut external_buffers =
+                OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
+            let columns = writer.finish(&mut external_buffers).await?;
+            for buffer in external_buffers.take_buffers() {
+                self.writer.write_all(&buffer).await?;
+            }
             debug_assert_eq!(
                 columns.len(),
                 writer.num_columns() as usize,
@@ -354,10 +486,8 @@ impl FileWriter {
                 for buffer in column.column_buffers {
                     column_metadata.buffer_offsets.push(buffer_pos);
                     let mut size = 0;
-                    for part in buffer.parts {
-                        self.writer.write_all(&part).await?;
-                        size += part.len() as u64;
-                    }
+                    Self::do_write_buffer(&mut self.writer, &buffer).await?;
+                    size += buffer.len() as u64;
                     buffer_pos += size;
                     column_metadata.buffer_sizes.push(size);
                 }
@@ -380,6 +510,17 @@ impl FileWriter {
         Ok(())
     }
 
+    /// Converts self.version (which is a mix of "software version" and
+    /// "format version" into a format version)
+    fn version_to_numbers(&self) -> (u16, u16) {
+        let version = self.options.format_version.unwrap_or_default();
+        match version.resolve() {
+            LanceFileVersion::V2_0 => (0, 3),
+            LanceFileVersion::V2_1 => (2, 1),
+            _ => panic!("Unsupported version: {}", version),
+        }
+    }
+
     /// Finishes writing the file
     ///
     /// This method will wait until all data has been flushed to the file.  Then it
@@ -389,15 +530,20 @@ impl FileWriter {
     /// Returns the total number of rows written
     pub async fn finish(&mut self) -> Result<u64> {
         // 1. flush any remaining data and write out those pages
+        let mut external_buffers =
+            OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self
             .column_writers
             .iter_mut()
-            .map(|writer| writer.flush())
+            .map(|writer| writer.flush(&mut external_buffers))
             .collect::<Result<Vec<_>>>()?;
+        for external_buffer in external_buffers.take_buffers() {
+            Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
+        }
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
-            .collect::<FuturesUnordered<_>>();
+            .collect::<FuturesOrdered<_>>();
         self.write_pages(encoding_tasks).await?;
 
         self.finish_writers().await?;
@@ -424,14 +570,15 @@ impl FileWriter {
             self.writer.write_u64_le(gbo_len).await?;
         }
 
+        let (major, minor) = self.version_to_numbers();
         // 7. write the footer
         self.writer.write_u64_le(column_metadata_start).await?;
         self.writer.write_u64_le(cmo_table_start).await?;
         self.writer.write_u64_le(gbo_table_start).await?;
         self.writer.write_u32_le(num_global_buffers).await?;
         self.writer.write_u32_le(self.num_columns).await?;
-        self.writer.write_u16_le(MAJOR_VERSION as u16).await?;
-        self.writer.write_u16_le(MINOR_VERSION_NEXT).await?;
+        self.writer.write_u16_le(major).await?;
+        self.writer.write_u16_le(minor).await?;
         self.writer.write_all(MAGIC).await?;
 
         // 7. close the writer
@@ -439,20 +586,12 @@ impl FileWriter {
         Ok(self.rows_written)
     }
 
-    pub fn multipart_id(&self) -> &str {
-        &self.writer.multipart_id
-    }
-
     pub async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await? as u64)
     }
 
-    pub fn field_id_to_column_indices(&self) -> &[(i32, i32)] {
+    pub fn field_id_to_column_indices(&self) -> &[(u32, u32)] {
         &self.field_id_to_column_indices
-    }
-
-    pub fn path(&self) -> &str {
-        &self.path
     }
 }
 
@@ -498,7 +637,14 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = Any::from_msg(&page_info.encoding)?.encode_to_vec();
+                let encoded_encoding = match &page_info.encoding {
+                    PageEncoding::Legacy(array_encoding) => {
+                        Any::from_msg(array_encoding)?.encode_to_vec()
+                    }
+                    PageEncoding::Structural(page_layout) => {
+                        Any::from_msg(page_layout)?.encode_to_vec()
+                    }
+                };
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
                     .buffer_offsets_and_sizes
                     .as_ref()
@@ -514,6 +660,7 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
                         })),
                     }),
                     length: page_info.num_rows,
+                    priority: page_info.priority,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -548,14 +695,16 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
         data.put_u64_le(gbo_len);
     }
 
+    let (major, minor) = LanceFileVersion::default().to_numbers();
+
     // write the footer
     data.put_u64_le(col_metadata_start);
     data.put_u64_le(cmo_table_start);
     data.put_u64_le(gbo_table_start);
     data.put_u32_le(num_global_buffers);
     data.put_u32_le(batch.page_table.len() as u32);
-    data.put_u16_le(MAJOR_VERSION as u16);
-    data.put_u16_le(MINOR_VERSION_NEXT);
+    data.put_u16_le(major as u16);
+    data.put_u16_le(minor as u16);
     data.put(MAGIC.as_slice());
 
     Ok(data.freeze())
@@ -599,13 +748,8 @@ mod tests {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
 
-        let mut file_writer = FileWriter::try_new(
-            writer,
-            tmp_path.to_string(),
-            lance_schema,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(writer, lance_schema, FileWriterOptions::default()).unwrap();
 
         for batch in reader {
             file_writer.write_batch(&batch.unwrap()).await.unwrap();
@@ -632,13 +776,8 @@ mod tests {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(reader.schema().as_ref()).unwrap();
 
-        let mut file_writer = FileWriter::try_new(
-            writer,
-            tmp_path.to_string(),
-            lance_schema,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
+        let mut file_writer =
+            FileWriter::try_new(writer, lance_schema, FileWriterOptions::default()).unwrap();
 
         for batch in reader {
             file_writer.write_batch(&batch.unwrap()).await.unwrap();

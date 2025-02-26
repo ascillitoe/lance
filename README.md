@@ -46,6 +46,9 @@ The key features of Lance include:
 
 * **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB and more on the way.
 
+> [!TIP]
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](docs/contributing.rst) for more information.
+
 ## Quick Start
 
 **Installation**
@@ -161,11 +164,12 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 
 ## Directory structure
 
-| Directory          | Description              |
-|--------------------|--------------------------|
-| [rust](./rust)     | Core Rust implementation |
-| [python](./python) | Python bindings (pyo3)   |
-| [docs](./docs)     | Documentation source     |
+| Directory          | Description                               |
+|--------------------|-------------------------------------------|
+| [rust](./rust)     | Core Rust implementation                  |
+| [python](./python) | Python bindings (PyO3)                    |
+| [java](./java)     | Java bindings (JNI) and Spark integration |
+| [docs](./docs)     | Documentation source                      |
 
 ## What makes Lance different
 

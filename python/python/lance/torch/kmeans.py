@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-import logging
 import time
 from typing import List, Literal, Optional, Tuple, Union
 
 import pyarrow as pa
 from tqdm import tqdm
 
-from lance.dependencies import _check_for_numpy, _check_for_torch, torch
+from lance.dependencies import (
+    _check_for_numpy,
+    _check_for_torch,
+    torch,
+)
 from lance.dependencies import numpy as np
+from lance.log import LOGGER
+from lance.util import MetricType, _normalize_metric_type
 
 from . import preferred_device
 from .data import TensorDataset
@@ -49,7 +54,7 @@ class KMeans:
         self,
         k: int,
         *,
-        metric: Literal["l2", "euclidean", "cosine", "dot"] = "l2",
+        metric: MetricType = "l2",
         init: Literal["random"] = "random",
         max_iters: int = 50,
         tolerance: float = 1e-4,
@@ -60,9 +65,8 @@ class KMeans:
         self.k = k
         self.max_iters = max_iters
 
-        metric = metric.lower()
-        self.metric = metric
-        if metric in ["l2", "euclidean", "cosine"]:
+        self.metric = _normalize_metric_type(metric)
+        if metric in ["l2", "cosine"]:
             # Cosine uses normalized unit vector and calculate l2 distance
             self.dist_func = l2_distance
         elif metric == "dot":
@@ -79,6 +83,8 @@ class KMeans:
         self.tolerance = tolerance
         self.seed = seed
 
+        self.y2 = None
+
     def __repr__(self):
         return f"KMeans(k={self.k}, metric={self.metric}, device={self.device})"
 
@@ -86,7 +92,10 @@ class KMeans:
         self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]
     ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
-            data = torch.from_numpy(np.stack(data.to_numpy(zero_copy_only=False)))
+            np_tensor = data.values.to_numpy(zero_copy_only=True).reshape(
+                -1, data.type.list_size
+            )
+            data = torch.from_numpy(np_tensor)
         elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
         elif isinstance(data, torch.Tensor):
@@ -104,7 +113,7 @@ class KMeans:
     def _random_init(self, data: Union[torch.Tensor, np.ndarray]):
         """Random centroid initialization."""
         if self.centroids is not None:
-            logging.debug("KMeans centroids already initialized")
+            LOGGER.debug("KMeans centroids already initialized")
             return
 
         is_numpy = _check_for_numpy(data) and isinstance(data, np.ndarray)
@@ -122,6 +131,7 @@ class KMeans:
             torch.Tensor,
             pa.FixedSizeListArray,
         ],
+        column: Optional[str] = None,
     ) -> None:
         """Fit - Train the kmeans model.
 
@@ -144,20 +154,20 @@ class KMeans:
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
 
-        logging.info(
+        LOGGER.info(
             "Start kmean training, metric: %s, iters: %s", self.metric, self.max_iters
         )
         self.total_distance = 0
         for i in tqdm(range(self.max_iters)):
             try:
                 self.total_distance = self._fit_once(
-                    data, i, last_dist=self.total_distance
+                    data, i, last_dist=self.total_distance, column=column
                 )
             except StopIteration:
                 break
             if i % 10 == 0:
-                logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
-        logging.info("Finish KMean training in %s", time.time() - start)
+                LOGGER.debug("Total distance: %s, iter: %s", self.total_distance, i)
+        LOGGER.info("Finish KMean training in %s", time.time() - start)
 
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
@@ -190,7 +200,11 @@ class KMeans:
         return num_rows
 
     def _fit_once(
-        self, data: torch.utils.data.IterableDataset, epoch: int, last_dist: float = 0.0
+        self,
+        data: torch.utils.data.IterableDataset,
+        epoch: int,
+        last_dist: float = 0.0,
+        column: Optional[str] = None,
     ) -> float:
         """Train KMean once and return the total distance.
 
@@ -208,7 +222,7 @@ class KMeans:
         float
             The total distance of the current centroids and the input data.
         """
-        total_dist = 0
+        total_dist = torch.tensor(0.0, device=self.device)
 
         # Use float32 to accumulate centroids, esp. if the vectors are
         # float16 / bfloat16 types.
@@ -217,21 +231,24 @@ class KMeans:
         )
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
-        y2 = (self.centroids * self.centroids).sum(dim=1)
+        self.rebuild_index()
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
-                logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
+                LOGGER.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
+            if column is not None:
+                chunk = chunk[column]
             chunk: torch.Tensor = chunk
             dtype = chunk.dtype
             chunk = chunk.to(self.device)
-            ids, dists = self._transform(chunk, y2=y2)
+            ids, dists = self._transform(chunk, y2=self.y2)
 
+            # Training is significantly faster w/o these checks
             valid_mask = ids >= 0
             if torch.any(~valid_mask):
                 chunk = chunk[valid_mask]
                 ids = ids[valid_mask]
 
-            total_dist += dists.nansum().item()
+            total_dist += dists.nansum()
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
@@ -241,11 +258,13 @@ class KMeans:
             del dists
             del chunk
 
+        total_dist = total_dist.item()
+
         # this happens when there are too many NaNs or the data is just the same
         # vectors repeated over and over. Performance may be bad but we don't
         # want to crash.
         if total_dist == 0:
-            logging.warning(
+            LOGGER.warning(
                 "Kmeans::train: total_dist is 0, this is unusual."
                 " This could result in bad performance during search."
             )
@@ -259,6 +278,9 @@ class KMeans:
             dtype
         )
         return total_dist
+
+    def rebuild_index(self):
+        self.y2 = (self.centroids * self.centroids).sum(dim=1)
 
     def _transform(
         self,

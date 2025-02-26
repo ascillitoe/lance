@@ -4,6 +4,7 @@
 //! Extend [object_store::ObjectStore] functionalities
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,9 +13,12 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
+use lance_core::utils::parse::str_is_truthy;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
@@ -23,20 +27,31 @@ use object_store::{
     aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
     memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
 };
-use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredentialProvider};
+use object_store::{
+    parse_url_opts, ClientOptions, DynObjectStore, RetryConfig, StaticCredentialProvider,
+};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
-use snafu::{location, Location};
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use snafu::location;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::RwLock;
 use url::Url;
 
 use super::local::LocalObjectReader;
-mod gcs_wrapper;
 mod tracing;
-use self::gcs_wrapper::PatchedGoogleCloudStorage;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
+
+// Local disks tend to do fine with a few threads
+// Note: the number of threads here also impacts the number of files
+// we need to read in some situations.  So keeping this at 8 keeps the
+// RAM on our scanner down.
+pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
+// Cloud disks often need many many threads to saturate the network
+pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
+
+pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -46,20 +61,20 @@ pub trait ObjectStoreExt {
     /// Read all files (start from base directory) recursively
     ///
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    async fn read_dir_all(
-        &self,
+    async fn read_dir_all<'a>(
+        &'a self,
         dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>>;
+    ) -> Result<BoxStream<'a, Result<ObjectMeta>>>;
 }
 
 #[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
-    async fn read_dir_all(
-        &self,
+    async fn read_dir_all<'a>(
+        &'a self,
         dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>> {
+    ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
         let mut output = self.list(Some(dir_path.into()));
         if let Some(unmodified_since_val) = unmodified_since {
             output = output
@@ -85,6 +100,15 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
     block_size: usize,
+    /// Whether to use constant size upload parts for multipart uploads. This
+    /// is only necessary for Cloudflare R2.
+    pub use_constant_size_upload_parts: bool,
+    /// Whether we can assume that the list of files is lexically ordered. This
+    /// is true for object stores, but not for local filesystems.
+    pub list_is_lexically_ordered: bool,
+    io_parallelism: usize,
+    /// Number of times to retry a failed download
+    download_retry_count: usize,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -103,6 +127,21 @@ impl std::fmt::Display for ObjectStore {
     }
 }
 
+pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
+    fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore>;
+}
+
+#[derive(Default, Debug)]
+pub struct ObjectStoreRegistry {
+    providers: HashMap<String, Arc<dyn ObjectStoreProvider>>,
+}
+
+impl ObjectStoreRegistry {
+    pub fn insert(&mut self, scheme: &str, provider: Arc<dyn ObjectStoreProvider>) {
+        self.providers.insert(scheme.into(), provider);
+    }
+}
+
 const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
 
 /// Adapt an AWS SDK cred into object_store credentials
@@ -110,7 +149,7 @@ const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
 pub struct AwsCredentialAdapter {
     pub inner: Arc<dyn ProvideCredentials>,
 
-    // RefCell can't be shared accross threads, so we use HashMap
+    // RefCell can't be shared across threads, so we use HashMap
     cache: Arc<RwLock<HashMap<String, Arc<aws_credential_types::Credentials>>>>,
 
     // The amount of time before expiry to refresh credentials
@@ -308,6 +347,12 @@ pub struct ObjectStoreParams {
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     pub storage_options: Option<HashMap<String, String>>,
+    /// Use constant size upload parts for multipart uploads. Only necessary
+    /// for Cloudflare R2, which doesn't support variable size parts. When this
+    /// is false, max upload size is 2.5TB. When this is true, the max size is
+    /// 50GB.
+    pub use_constant_size_upload_parts: bool,
+    pub list_is_lexically_ordered: Option<bool>,
 }
 
 impl Default for ObjectStoreParams {
@@ -319,6 +364,8 @@ impl Default for ObjectStoreParams {
             aws_credentials: None,
             object_store_wrapper: None,
             storage_options: None,
+            use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: None,
         }
     }
 }
@@ -343,23 +390,43 @@ impl ObjectStore {
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
     pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
-        Self::from_uri_and_params(uri, &ObjectStoreParams::default()).await
+        let registry = Arc::new(ObjectStoreRegistry::default());
+
+        Self::from_uri_and_params(registry, uri, &ObjectStoreParams::default()).await
     }
 
     /// Parse from a string URI.
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
     pub async fn from_uri_and_params(
+        registry: Arc<ObjectStoreRegistry>,
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Self, Path)> {
+        if let Some((store, path)) = params.object_store.as_ref() {
+            let mut inner = store.clone();
+            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                inner = wrapper.wrap(inner);
+            }
+            let store = Self {
+                inner,
+                scheme: path.scheme().to_string(),
+                block_size: params.block_size.unwrap_or(64 * 1024),
+                use_constant_size_upload_parts: params.use_constant_size_upload_parts,
+                list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+            };
+            let path = Path::from(path.path());
+            return Ok((store, path));
+        }
         let (object_store, path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
                 Self::from_path(uri)
             }
             Ok(url) => {
-                let store = Self::new_from_url(url.clone(), params.clone()).await?;
+                let store = Self::new_from_url(registry, url.clone(), params.clone()).await?;
                 Ok((store, Path::from(url.path())))
             }
             Err(_) => Self::from_path(uri),
@@ -388,7 +455,7 @@ impl ObjectStore {
         // path_abs::PathAbs::new(".") returns an empty string.
         if let Some(s) = expanded_path.as_path().to_str() {
             if s.is_empty() {
-                expanded_path = std::env::current_dir()?.to_path_buf();
+                expanded_path = std::env::current_dir()?;
             }
         }
         Ok((
@@ -396,6 +463,10 @@ impl ObjectStore {
                 inner: Arc::new(LocalFileSystem::new()).traced(),
                 scheme: String::from(scheme),
                 block_size: 4 * 1024, // 4KB block size
+                use_constant_size_upload_parts: false,
+                list_is_lexically_ordered: false,
+                io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
+                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
             },
             Path::from_absolute_path(expanded_path.as_path())?,
         ))
@@ -405,8 +476,12 @@ impl ObjectStore {
         Self::from_path_with_scheme(str_path, "file")
     }
 
-    async fn new_from_url(url: Url, params: ObjectStoreParams) -> Result<Self> {
-        configure_store(url.as_str(), params).await
+    async fn new_from_url(
+        registry: Arc<ObjectStoreRegistry>,
+        url: Url,
+        params: ObjectStoreParams,
+    ) -> Result<Self> {
+        configure_store(registry, url.as_str(), params).await
     }
 
     /// Local object store.
@@ -415,6 +490,10 @@ impl ObjectStore {
             inner: Arc::new(LocalFileSystem::new()).traced(),
             scheme: String::from("file"),
             block_size: 4 * 1024, // 4KB block size
+            use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: false,
+            io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
+            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
         }
     }
 
@@ -423,7 +502,11 @@ impl ObjectStore {
         Self {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            block_size: 64 * 1024,
+            block_size: 4 * 1024,
+            use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: true,
+            io_parallelism: get_num_compute_intensive_cpus(),
+            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
         }
     }
 
@@ -432,12 +515,26 @@ impl ObjectStore {
         self.scheme == "file"
     }
 
+    pub fn is_cloud(&self) -> bool {
+        self.scheme != "file" && self.scheme != "memory"
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }
 
     pub fn set_block_size(&mut self, new_size: usize) {
         self.block_size = new_size;
+    }
+
+    pub fn set_io_parallelism(&mut self, io_parallelism: usize) {
+        self.io_parallelism = io_parallelism;
+    }
+
+    pub fn io_parallelism(&self) -> usize {
+        std::env::var("LANCE_IO_THREADS")
+            .map(|val| val.parse::<usize>().unwrap())
+            .unwrap_or(self.io_parallelism)
     }
 
     /// Open a file for path.
@@ -452,6 +549,7 @@ impl ObjectStore {
                 path.clone(),
                 self.block_size,
                 None,
+                self.download_retry_count,
             )?)),
         }
     }
@@ -469,6 +567,7 @@ impl ObjectStore {
                 path.clone(),
                 self.block_size,
                 Some(known_size),
+                self.download_retry_count,
             )?)),
         }
     }
@@ -489,11 +588,10 @@ impl ObjectStore {
 
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
-        ObjectWriter::new(self.inner.as_ref(), path).await
+        ObjectWriter::new(self, path).await
     }
 
     /// A helper function to create a file and write content to it.
-    ///
     pub async fn put(&self, path: &Path, content: &[u8]) -> Result<()> {
         let mut writer = self.create(path).await?;
         writer.write_all(content).await?;
@@ -557,7 +655,7 @@ impl ObjectStore {
     pub fn remove_stream<'a>(
         &'a self,
         locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<Result<Path>> {
+    ) -> BoxStream<'a, Result<Path>> {
         self.inner
             .delete_stream(locations.err_into::<ObjectStoreError>().boxed())
             .err_into::<Error>()
@@ -577,7 +675,44 @@ impl ObjectStore {
     pub async fn size(&self, path: &Path) -> Result<usize> {
         Ok(self.inner.head(path).await?.size)
     }
+
+    /// Convenience function to open a reader and read all the bytes
+    pub async fn read_one_all(&self, path: &Path) -> Result<Bytes> {
+        let reader = self.open(path).await?;
+        Ok(reader.get_all().await?)
+    }
+
+    /// Convenience function open a reader and make a single request
+    ///
+    /// If you will be making multiple requests to the path it is more efficient to call [`Self::open`]
+    /// and then call [`Reader::get_range`] multiple times.
+    pub async fn read_one_range(&self, path: &Path, range: Range<usize>) -> Result<Bytes> {
+        let reader = self.open(path).await?;
+        Ok(reader.get_range(range).await?)
+    }
 }
+
+/// Options that can be set for multiple object stores
+#[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
+pub enum LanceConfigKey {
+    /// Number of times to retry a download that fails
+    DownloadRetryCount,
+}
+
+impl FromStr for LanceConfigKey {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "download_retry_count" => Ok(Self::DownloadRetryCount),
+            _ => Err(Error::InvalidInput {
+                source: format!("Invalid LanceConfigKey: {}", s).into(),
+                location: location!(),
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StorageOptions(pub HashMap<String, String>);
 
@@ -646,6 +781,33 @@ impl StorageOptions {
         })
     }
 
+    /// Number of times to retry a download that fails
+    pub fn download_retry_count(&self) -> usize {
+        self.0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("download_retry_count"))
+            .map(|(_, value)| value.parse::<usize>().unwrap_or(3))
+            .unwrap_or(3)
+    }
+
+    /// Max retry times to set in RetryConfig for s3 client
+    pub fn client_max_retries(&self) -> usize {
+        self.0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_max_retries"))
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(10)
+    }
+
+    /// Seconds of timeout to set in RetryConfig for s3 client
+    pub fn client_retry_timeout(&self) -> u64 {
+        self.0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_retry_timeout"))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .unwrap_or(180)
+    }
+
     /// Subset of options relevant for azure storage
     pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
         self.0
@@ -686,12 +848,19 @@ impl From<HashMap<String, String>> for StorageOptions {
     }
 }
 
-async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<ObjectStore> {
-    let mut storage_options = StorageOptions(options.storage_options.unwrap_or_default());
+async fn configure_store(
+    registry: Arc<ObjectStoreRegistry>,
+    url: &str,
+    options: ObjectStoreParams,
+) -> Result<ObjectStore> {
+    let mut storage_options = StorageOptions(options.storage_options.clone().unwrap_or_default());
+    let download_retry_count = storage_options.download_retry_count();
     let mut url = ensure_table_uri(url)?;
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
     // block size where we don't see a latency penalty.
+    let file_block_size = options.block_size.unwrap_or(4 * 1024);
+    let cloud_block_size = options.block_size.unwrap_or(64 * 1024);
     match url.scheme() {
         "s3" | "s3+ddb" => {
             storage_options.with_env_s3();
@@ -704,6 +873,13 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             //     });
             // }
 
+            let max_retries = storage_options.client_max_retries();
+            let retry_timeout = storage_options.client_retry_timeout();
+            let retry_config = RetryConfig {
+                backoff: Default::default(),
+                max_retries,
+                retry_timeout: Duration::from_secs(retry_timeout),
+            };
             let storage_options = storage_options.as_s3_options();
             let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
@@ -713,6 +889,12 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 region,
             )
             .await?;
+
+            // Cloudflare does not support varying part sizes.
+            let use_constant_size_upload_parts = storage_options
+                .get(&AmazonS3ConfigKey::Endpoint)
+                .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
+                .unwrap_or(false);
 
             // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
             url.set_scheme("s3").map_err(|()| Error::Internal {
@@ -730,13 +912,18 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
             builder = builder
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
+                .with_retry(retry_config)
                 .with_region(region);
             let store = builder.build()?;
 
             Ok(ObjectStore {
-                inner: Arc::new(store),
+                inner: Arc::new(store).traced(),
                 scheme: String::from(url.scheme()),
-                block_size: 64 * 1024,
+                block_size: cloud_block_size,
+                use_constant_size_upload_parts,
+                list_is_lexically_ordered: true,
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count,
             })
         }
         "gs" => {
@@ -746,56 +933,82 @@ async fn configure_store(url: &str, options: ObjectStoreParams) -> Result<Object
                 builder = builder.with_config(key, value);
             }
             let store = builder.build()?;
-            // Temporary fix for having larger object sizes. Replace when
-            // object_store 0.10.0 is available.
-            let store = PatchedGoogleCloudStorage(Arc::new(store));
-            let store = Arc::new(store);
+            let store = Arc::new(store).traced();
 
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("gs"),
-                block_size: 64 * 1024,
+                block_size: cloud_block_size,
+                use_constant_size_upload_parts: false,
+                list_is_lexically_ordered: true,
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count,
             })
         }
         "az" => {
             storage_options.with_env_azure();
             let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
-            let store = Arc::new(store);
+            let store = Arc::new(store).traced();
 
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("az"),
-                block_size: 64 * 1024,
+                block_size: cloud_block_size,
+                use_constant_size_upload_parts: false,
+                list_is_lexically_ordered: true,
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count,
             })
         }
         // we have a bypass logic to use `tokio::fs` directly to lower overhead
         // however this makes testing harder as we can't use the same code path
         // "file-object-store" forces local file system dataset to use the same
         // code path as cloud object stores
-        "file" => Ok(ObjectStore::from_path(url.path())?.0),
+        "file" => {
+            let mut object_store = ObjectStore::from_path(url.path())?.0;
+            object_store.set_block_size(file_block_size);
+            Ok(object_store)
+        }
         "file-object-store" => {
-            Ok(ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0)
+            let mut object_store =
+                ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0;
+            object_store.set_block_size(file_block_size);
+            Ok(object_store)
         }
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            block_size: 64 * 1024,
+            block_size: file_block_size,
+            use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: true,
+            io_parallelism: get_num_compute_intensive_cpus(),
+            download_retry_count,
         }),
-        unknow_scheme => {
-            let err = lance_core::Error::from(object_store::Error::NotSupported {
-                source: format!("Unsupported URI scheme: {}", unknow_scheme).into(),
-            });
-            Err(err)
+        unknown_scheme => {
+            if let Some(provider) = registry.providers.get(unknown_scheme) {
+                provider.new_store(url, &options)
+            } else {
+                let err = lance_core::Error::from(object_store::Error::NotSupported {
+                    source: format!("Unsupported URI scheme: {} in url {}", unknown_scheme, url)
+                        .into(),
+                });
+                Err(err)
+            }
         }
     }
 }
 
 impl ObjectStore {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<DynObjectStore>,
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        use_constant_size_upload_parts: bool,
+        list_is_lexically_ordered: bool,
+        io_parallelism: usize,
+        download_retry_count: usize,
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
@@ -809,6 +1022,10 @@ impl ObjectStore {
             inner: store,
             scheme: scheme.into(),
             block_size,
+            use_constant_size_upload_parts,
+            list_is_lexically_ordered,
+            io_parallelism,
+            download_retry_count,
         }
     }
 }
@@ -821,14 +1038,6 @@ fn infer_block_size(scheme: &str) -> usize {
         "file" => 4 * 1024,
         _ => 64 * 1024,
     }
-}
-
-fn str_is_truthy(val: &str) -> bool {
-    val.eq_ignore_ascii_case("1")
-        | val.eq_ignore_ascii_case("true")
-        | val.eq_ignore_ascii_case("on")
-        | val.eq_ignore_ascii_case("yes")
-        | val.eq_ignore_ascii_case("y")
 }
 
 /// Attempt to create a Url from given table location.
@@ -856,10 +1065,8 @@ pub fn ensure_table_uri(table_uri: impl AsRef<str>) -> Result<Url> {
                 Error::InvalidTableLocation { message: msg }
             })?)
         // NOTE this check is required to support absolute windows paths which may properly parse as url
-        } else if KNOWN_SCHEMES.contains(&url.scheme()) {
-            UriType::Url(url)
         } else {
-            UriType::LocalPath(PathBuf::from(table_uri))
+            UriType::Url(url)
         }
     } else {
         UriType::LocalPath(PathBuf::from(table_uri))
@@ -907,6 +1114,7 @@ lazy_static::lazy_static! {
 mod tests {
     use super::*;
     use parquet::data_type::AsBytes;
+    use rstest::rstest;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
     use std::path::Path as StdPath;
@@ -970,6 +1178,65 @@ mod tests {
             .unwrap();
         assert_eq!(store.scheme, "gs");
         assert_eq!(path.to_string(), "foo.lance");
+    }
+
+    async fn test_block_size_used_test_helper(
+        uri: &str,
+        storage_options: Option<HashMap<String, String>>,
+        default_expected_block_size: usize,
+    ) {
+        // Test the default
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            storage_options: storage_options.clone(),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, default_expected_block_size);
+
+        // Ensure param is used
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            block_size: Some(1024),
+            storage_options: storage_options.clone(),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, 1024);
+    }
+
+    #[rstest]
+    #[case("s3://bucket/foo.lance", None)]
+    #[case("gs://bucket/foo.lance", None)]
+    #[case("az://account/bucket/foo.lance",
+      Some(HashMap::from([
+            (String::from("account_name"), String::from("account")),
+            (String::from("container_name"), String::from("container"))
+           ])))]
+    #[tokio::test]
+    async fn test_block_size_used_cloud(
+        #[case] uri: &str,
+        #[case] storage_options: Option<HashMap<String, String>>,
+    ) {
+        test_block_size_used_test_helper(uri, storage_options, 64 * 1024).await;
+    }
+
+    #[rstest]
+    #[case("file")]
+    #[case("file-object-store")]
+    #[case("memory:///bucket/foo.lance")]
+    #[tokio::test]
+    async fn test_block_size_used_file(#[case] prefix: &str) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
+        let path = format!("{tmp_path}/bar/foo.lance/test_file");
+        write_to_file(&path, "URL").unwrap();
+        let uri = format!("{prefix}:///{path}");
+        test_block_size_used_test_helper(&uri, None, 4 * 1024).await;
     }
 
     #[tokio::test]
@@ -1069,6 +1336,7 @@ mod tests {
     async fn test_wrapping_object_store_option_is_used() {
         // Make a store for the inner store first
         let mock_inner_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let registry = Arc::new(ObjectStoreRegistry::default());
 
         assert_eq!(Arc::strong_count(&mock_inner_store), 1);
 
@@ -1085,7 +1353,7 @@ mod tests {
         // not called yet
         assert!(!wrapper.called());
 
-        let _ = ObjectStore::from_uri_and_params("memory:///", &params)
+        let _ = ObjectStore::from_uri_and_params(registry, "memory:///", &params)
             .await
             .unwrap();
 
@@ -1119,6 +1387,7 @@ mod tests {
     #[tokio::test]
     async fn test_injected_aws_creds_option_is_used() {
         let mock_provider = Arc::new(MockAwsCredentialsProvider::default());
+        let registry = Arc::new(ObjectStoreRegistry::default());
 
         let params = ObjectStoreParams {
             aws_credentials: Some(mock_provider.clone() as AwsCredentialProvider),
@@ -1128,7 +1397,7 @@ mod tests {
         // Not called yet
         assert!(!mock_provider.called.load(Ordering::Relaxed));
 
-        let (store, _) = ObjectStore::from_uri_and_params("s3://not-a-bucket", &params)
+        let (store, _) = ObjectStore::from_uri_and_params(registry, "s3://not-a-bucket", &params)
             .await
             .unwrap();
 
@@ -1157,6 +1426,26 @@ mod tests {
 
         let reader = ObjectStore::open_local(file_path.as_path()).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
+        assert_eq!(buf.as_bytes(), b"LOCAL");
+    }
+
+    #[tokio::test]
+    async fn test_read_one() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let file_path = temp_dir.path().join("test_file");
+        let mut writer = ObjectStore::create_local_writer(file_path.as_path())
+            .await
+            .unwrap();
+        writer.write_all(b"LOCAL").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
+        let obj_store = ObjectStore::local();
+        let buf = obj_store.read_one_all(&file_path_os).await.unwrap();
+        assert_eq!(buf.as_bytes(), b"LOCAL");
+
+        let buf = obj_store.read_one_range(&file_path_os, 0..5).await.unwrap();
         assert_eq!(buf.as_bytes(), b"LOCAL");
     }
 

@@ -7,10 +7,10 @@ use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use lance_arrow::DataTypeExt;
-use lance_file::writer::ManifestProvider;
+use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
 use object_store::path::Path;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use lance_core::{datatypes::Schema, Error, Result};
@@ -22,14 +22,22 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{pb, Index, Manifest, MAGIC};
+use crate::format::{pb, DataStorageFormat, Index, Manifest, MAGIC};
 
 /// Read Manifest on URI.
 ///
 /// This only reads manifest files. It does not read data files.
 #[instrument(level = "debug", skip(object_store))]
-pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Manifest> {
-    let file_size = object_store.inner.head(path).await?.size;
+pub async fn read_manifest(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<Manifest> {
+    let file_size = if let Some(known_size) = known_size {
+        known_size as usize
+    } else {
+        object_store.inner.head(path).await?.size
+    };
     const PREFETCH_SIZE: usize = 64 * 1024;
     let initial_start = std::cmp::max(file_size as i64 - PREFETCH_SIZE as i64, 0) as usize;
     let range = Range {
@@ -53,7 +61,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     let manifest_len = file_size - manifest_pos;
 
     let buf: Bytes = if manifest_len <= buf.len() {
-        // The prefetch catpured the entire manifest. We just need to trim the buffer.
+        // The prefetch captured the entire manifest. We just need to trim the buffer.
         buf.slice(buf.len() - manifest_len..buf.len())
     } else {
         // The prefetch only captured part of the manifest. We need to make an
@@ -197,7 +205,12 @@ impl ManifestProvider for ManifestDescribing {
         object_writer: &mut ObjectWriter,
         schema: &Schema,
     ) -> Result<Option<usize>> {
-        let mut manifest = Manifest::new(schema.clone(), Arc::new(vec![]));
+        let mut manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(LanceFileVersion::Legacy),
+            /*blob_dataset_version= */ None,
+        );
         let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
         Ok(Some(pos))
     }
@@ -239,7 +252,16 @@ mod test {
         let arrow_schema =
             ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut manifest = Manifest::new(schema, Arc::new(vec![]));
+
+        let mut config = HashMap::new();
+        config.insert("key".to_string(), "value".to_string());
+
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+        );
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await
             .unwrap();
@@ -249,7 +271,7 @@ mod test {
             .unwrap();
         writer.shutdown().await.unwrap();
 
-        let roundtripped_manifest = read_manifest(&store, &path).await.unwrap();
+        let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
 
         assert_eq!(manifest, roundtripped_manifest);
 

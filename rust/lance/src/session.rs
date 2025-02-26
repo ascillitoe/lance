@@ -8,7 +8,7 @@ use deepsize::DeepSizeOf;
 use lance_core::cache::FileMetadataCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::index::cache::IndexCache;
@@ -31,7 +31,28 @@ pub struct Session {
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Session()")
+        f.debug_struct("Session")
+            .field(
+                "index_cache",
+                &format!(
+                    "IndexCache(items={}, size_bytes={})",
+                    self.index_cache.get_size(),
+                    self.index_cache.deep_size_of()
+                ),
+            )
+            .field(
+                "file_metadata_cache",
+                &format!(
+                    "FileMetadataCache(items={}, size_bytes={})",
+                    self.file_metadata_cache.size(),
+                    self.file_metadata_cache.deep_size_of()
+                ),
+            )
+            .field(
+                "index_extensions",
+                &self.index_extensions.keys().collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 
@@ -63,12 +84,6 @@ impl Session {
         extension: Arc<dyn IndexExtension>,
     ) -> Result<()> {
         match extension.index_type() {
-            IndexType::Scalar => {
-                return Err(Error::invalid_input(
-                    "scalar index extension is not support yet".to_string(),
-                    location!(),
-                ));
-            }
             IndexType::Vector => {
                 if self
                     .index_extensions
@@ -89,6 +104,15 @@ impl Session {
                         location!(),
                     ));
                 }
+            }
+            _ => {
+                return Err(Error::invalid_input(
+                    format!(
+                        "scalar index extension is not support yet: {}",
+                        extension.index_type()
+                    ),
+                    location!(),
+                ));
             }
         }
 
@@ -117,12 +141,13 @@ impl Default for Session {
 mod tests {
     use super::*;
 
-    use arrow_array::types::Float32Type;
+    use arrow_array::{FixedSizeListArray, Float32Array};
+    use lance_arrow::FixedSizeListArrayExt;
     use std::sync::Arc;
 
     use crate::index::vector::pq::PQIndex;
-    use lance_index::vector::pq::ProductQuantizerImpl;
-    use lance_linalg::distance::MetricType;
+    use lance_index::vector::pq::ProductQuantizer;
+    use lance_linalg::distance::DistanceType;
 
     #[test]
     fn test_disable_index_cache() {
@@ -130,14 +155,15 @@ mod tests {
         assert!(no_cache.index_cache.get_vector("abc").is_none());
         let no_cache = Arc::new(no_cache);
 
-        let pq = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
+        let pq = ProductQuantizer::new(
             1,
             8,
             1,
-            Arc::new(vec![0.0f32; 8].into()),
-            MetricType::L2,
-        ));
-        let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 1)
+                .unwrap(),
+            DistanceType::L2,
+        );
+        let idx = Arc::new(PQIndex::new(pq, DistanceType::L2));
         no_cache.index_cache.insert_vector("abc", idx);
 
         assert!(no_cache.index_cache.get_vector("abc").is_none());
@@ -149,14 +175,15 @@ mod tests {
         let session = Session::new(10, 1);
         let session = Arc::new(session);
 
-        let pq = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
+        let pq = ProductQuantizer::new(
             1,
             8,
             1,
-            Arc::new(vec![0.0f32; 8].into()),
-            MetricType::L2,
-        ));
-        let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 1)
+                .unwrap(),
+            DistanceType::L2,
+        );
+        let idx = Arc::new(PQIndex::new(pq, DistanceType::L2));
         assert_eq!(session.index_cache.get_size(), 0);
 
         assert_eq!(session.index_cache.hit_rate(), 1.0);
@@ -173,14 +200,15 @@ mod tests {
         assert_eq!(session.index_cache.get_size(), 1);
 
         for iter_idx in 0..100 {
-            let pq_other = Arc::new(ProductQuantizerImpl::<Float32Type>::new(
+            let pq_other = ProductQuantizer::new(
                 1,
                 8,
                 1,
-                Arc::new(vec![0.0f32; 8].into()),
-                MetricType::L2,
-            ));
-            let idx_other = Arc::new(PQIndex::new(pq_other, MetricType::L2));
+                FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 1)
+                    .unwrap(),
+                DistanceType::L2,
+            );
+            let idx_other = Arc::new(PQIndex::new(pq_other, DistanceType::L2));
             session
                 .index_cache
                 .insert_vector(format!("{iter_idx}").as_str(), idx_other.clone());

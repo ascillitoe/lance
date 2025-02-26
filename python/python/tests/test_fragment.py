@@ -3,11 +3,13 @@
 
 import json
 import multiprocessing
+import uuid
 from pathlib import Path
 
 import lance
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 from helper import ProgressForTest
 from lance import (
@@ -18,6 +20,7 @@ from lance import (
     write_dataset,
 )
 from lance.debug import format_fragment
+from lance.file import LanceFileWriter
 from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
@@ -30,8 +33,14 @@ def test_write_fragment(tmp_path: Path):
 
     df = pd.DataFrame({"a": [1, 2, 3, 4, 5]})
     frag = LanceFragment.create(tmp_path, df)
-    meta = frag.to_json()
 
+    assert len(frag.files) == 1
+    assert frag.files[0].fields == [0]
+    assert frag.physical_rows == 5
+    assert frag.row_id_meta is None
+    assert frag.deletion_file is None
+
+    meta = frag.to_json()
     assert "id" in meta
     assert "files" in meta
     assert meta["files"][0]["fields"] == [0]
@@ -58,14 +67,14 @@ def test_write_fragment_two_phases(tmp_path: Path):
     )
 
 
-def test_write_v2_fragment(tmp_path: Path):
+def test_write_legacy_fragment(tmp_path: Path):
     tab = pa.table({"a": range(1024)})
-    frag = LanceFragment.create(tmp_path, tab, use_legacy_format=True)
-    assert "file_minor_version: 3" not in str(frag)
+    frag = LanceFragment.create(tmp_path, tab, data_storage_version="legacy")
+    assert "file_major_version=2" not in str(frag)
 
     tab = pa.table({"a": range(1024)})
-    frag = LanceFragment.create(tmp_path, tab, use_legacy_format=False)
-    assert "file_minor_version: 3" in str(frag)
+    frag = LanceFragment.create(tmp_path, tab, data_storage_version="stable")
+    assert "file_major_version=2" in str(frag)
 
 
 def test_scan_fragment(tmp_path: Path):
@@ -97,15 +106,18 @@ def test_scan_fragment_with_dynamic_projection(tmp_path: Path):
 
 
 def test_write_fragments(tmp_path: Path):
-    # This will be split across two files if we set the max_bytes_per_file to 1024
-    tab = pa.table(
-        {
-            "a": pa.array(range(1024)),
-        }
+    # Should result in two files since each batch is 8MB and max_bytes_per_file is small
+    batches = pa.RecordBatchReader.from_batches(
+        pa.schema([pa.field("a", pa.string())]),
+        [
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+        ],
     )
+
     progress = ProgressForTest()
     fragments = write_fragments(
-        tab,
+        batches,
         tmp_path,
         max_rows_per_group=512,
         max_bytes_per_file=1024,
@@ -128,9 +140,9 @@ def test_write_fragments_schema_holes(tmp_path: Path):
     dataset.drop_columns(["b"])
 
     def get_field_ids(fragment):
-        return [id for f in fragment.data_files() for id in f.field_ids()]
+        return [id for f in fragment.files for id in f.fields]
 
-    field_ids = get_field_ids(dataset.get_fragments()[0])
+    field_ids = get_field_ids(dataset.get_fragments()[0].metadata)
 
     data = pa.table({"a": range(3, 6), "c": range(5, 8)})
     fragment = LanceFragment.create(tmp_path, data)
@@ -198,11 +210,11 @@ def test_dataset_progress(tmp_path: Path):
     assert metadata["id"] == 0
     assert len(metadata["files"]) == 1
     # Fragments aren't exactly equal, because the file was written before
-    # physical_rows was known.
-    assert (
-        fragment.data_files()
-        == FragmentMetadata.from_json(json.dumps(metadata)).data_files()
-    )
+    # physical_rows was known.  However, the paths should be the same.
+    assert len(fragment.files) == 1
+    deserialized = FragmentMetadata.from_json(json.dumps(metadata))
+    assert len(deserialized.files) == 1
+    assert fragment.files[0].path == deserialized.files[0].path
 
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=failing_write, args=(progress_uri, dataset_uri))
@@ -217,7 +229,6 @@ def test_dataset_progress(tmp_path: Path):
     with open(progress_uri / "fragment_1.in_progress") as f:
         progress_data = json.load(f)
     assert progress_data["fragment_id"] == 1
-    assert isinstance(progress_data["multipart_id"], str)
     # progress contains custom metadata
     assert progress_data["metadata"]["test_key"] == "test_value"
 
@@ -225,11 +236,6 @@ def test_dataset_progress(tmp_path: Path):
     with open(progress_uri / "fragment_1.json") as f:
         metadata = json.load(f)
     assert metadata["id"] == 1
-
-    progress.cleanup_partial_writes(str(dataset_uri))
-
-    assert not (progress_uri / "fragment_1.json").exists()
-    assert not (progress_uri / "fragment_1.in_progress").exists()
 
 
 def test_fragment_meta():
@@ -247,16 +253,17 @@ def test_fragment_meta():
     meta = FragmentMetadata.from_json(json.dumps(data))
 
     assert meta.id == 0
-    assert len(meta.data_files()) == 2
-    assert meta.data_files()[0].path() == "0.lance"
-    assert meta.data_files()[1].path() == "1.lance"
+    assert len(meta.files) == 2
+    with pytest.warns(DeprecationWarning):
+        assert meta.files[0].path() == "0.lance"
+    assert meta.files[1].path == "1.lance"
 
     assert repr(meta) == (
-        'Fragment { id: 0, files: [DataFile { path: "0.lance", fields: [0], '
-        "column_indices: [], file_major_version: 0, file_minor_version: 0 }, "
-        'DataFile { path: "1.lance", fields: [1], column_indices: [], '
-        "file_major_version: 0, file_minor_version: 0 }], deletion_file: None, "
-        "row_id_meta: None, physical_rows: Some(100) }"
+        "FragmentMetadata(id=0, files=[DataFile(path='0.lance', fields=[0], "
+        "column_indices=[], file_major_version=0, file_minor_version=0), "
+        "DataFile(path='1.lance', fields=[1], column_indices=[], "
+        "file_major_version=0, file_minor_version=0)], physical_rows=100, "
+        "deletion_file=None, row_id_meta=None)"
     )
 
 
@@ -271,8 +278,160 @@ def test_fragment_v2(tmp_path):
     fragments = write_fragments(
         tab,
         tmp_path,
-        use_legacy_format=False,
+        data_storage_version="stable",
     )
     assert len(fragments) == 1
     ds = lance.dataset(dataset_uri)
-    assert "minor_version: 3" in format_fragment(fragments[0], ds)
+    assert "major_version: 2" in format_fragment(fragments[0], ds)
+
+
+def test_mixed_fragment_versions(tmp_path):
+    data = pa.table({"a": range(800), "b": range(800)})
+
+    # Create empty v2 dataset
+    ds = lance.write_dataset(
+        data_obj=[],
+        uri=tmp_path / "dataset2",
+        schema=data.schema,
+        data_storage_version="stable",
+    )
+
+    # Add one v1 file and one v2 file
+    fragments = []
+    fragments.append(
+        lance.LanceFragment.create(ds.uri, data, data_storage_version="legacy")
+    )
+    fragments.append(
+        lance.LanceFragment.create(ds.uri, data, data_storage_version="stable")
+    )
+
+    # Attempt to commit
+    operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
+    with pytest.raises(OSError, match="All data files must have the same version"):
+        lance.LanceDataset.commit(ds.uri, operation)
+
+
+def test_create_from_file(tmp_path):
+    data = pa.table({"a": range(800), "b": range(800)})
+    dataset = lance.write_dataset(
+        [], tmp_path, schema=data.schema, data_storage_version="stable"
+    )
+
+    # Append first file
+    fragment_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / fragment_name)) as writer:
+        writer.write_batch(data)
+
+    frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
+    op = LanceOperation.Append([frag])
+
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
+    frag = dataset.get_fragments()[0]
+    assert frag.fragment_id == 0
+
+    assert dataset.count_rows() == 800
+
+    # Append second file (fragment id shouldn't be 0 even though we pass in 0)
+    fragment_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / fragment_name)) as writer:
+        writer.write_batch(data)
+
+    frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
+    op = LanceOperation.Append([frag])
+
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
+    frag = dataset.get_fragments()[1]
+    assert frag.fragment_id == 1
+
+    assert dataset.count_rows() == 1600
+
+    # Simulate compaction
+    compacted_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / compacted_name)) as writer:
+        for batch in dataset.to_batches():
+            writer.write_batch(batch)
+
+    frag = LanceFragment.create_from_file(compacted_name, dataset, 0)
+    group = LanceOperation.RewriteGroup(
+        old_fragments=[frag.metadata for frag in dataset.get_fragments()],
+        new_fragments=[frag],
+    )
+    op = LanceOperation.Rewrite(groups=[group], rewritten_indices=[])
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
+
+    assert dataset.count_rows() == 1600
+    assert len(dataset.get_fragments()) == 1
+    assert dataset.get_fragments()[0].fragment_id == 2
+
+
+def test_fragment_merge(tmp_path):
+    schema = pa.schema([pa.field("a", pa.string())])
+    batches = pa.RecordBatchReader.from_batches(
+        schema,
+        [
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+        ],
+    )
+
+    progress = ProgressForTest()
+    fragments = write_fragments(
+        batches,
+        tmp_path,
+        max_rows_per_group=512,
+        max_bytes_per_file=1024,
+        progress=progress,
+    )
+
+    operation = lance.LanceOperation.Overwrite(schema, fragments)
+    dataset = lance.LanceDataset.commit(tmp_path, operation)
+    merged = []
+    schema = None
+    for fragment in dataset.get_fragments():
+        table = fragment.scanner(with_row_id=True, columns=[]).to_table()
+        table = table.add_column(0, "b", [[i for i in range(len(table))]])
+        fragment, schema = fragment.merge(table, "_rowid")
+        merged.append(fragment)
+
+    merge = lance.LanceOperation.Merge(merged, schema)
+    dataset = lance.LanceDataset.commit(
+        tmp_path, merge, read_version=dataset.latest_version
+    )
+
+    merged = []
+    schema = None
+    for fragment in dataset.get_fragments():
+        table = fragment.scanner(with_row_address=True, columns=[]).to_table()
+        table = table.add_column(0, "c", [[i + 1 for i in range(len(table))]])
+        fragment, schema = fragment.merge(table, "_rowaddr")
+        merged.append(fragment)
+
+    merge = lance.LanceOperation.Merge(merged, schema)
+    dataset = lance.LanceDataset.commit(
+        tmp_path, merge, read_version=dataset.latest_version
+    )
+
+    merged = []
+    for fragment in dataset.get_fragments():
+        table = fragment.scanner(columns=["b"]).to_table()
+        table = table.add_column(0, "d", [[i + 2 for i in range(len(table))]])
+        fragment, schema = fragment.merge(table, "b")
+        merged.append(fragment)
+
+    merge = lance.LanceOperation.Merge(merged, schema)
+    dataset = lance.LanceDataset.commit(
+        tmp_path, merge, read_version=dataset.latest_version
+    )
+    assert [f.name for f in dataset.schema] == ["a", "b", "c", "d"]
+
+
+def test_fragment_count_rows(tmp_path: Path):
+    data = pa.table({"a": range(800), "b": range(800)})
+    ds = write_dataset(data, tmp_path)
+
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+
+    assert fragments[0].count_rows() == 800
+    assert fragments[0].count_rows("a < 200") == 200
+    assert fragments[0].count_rows(pc.field("a") < 200) == 200

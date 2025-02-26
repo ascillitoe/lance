@@ -3,10 +3,13 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
+use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
+use arrow::array::AsArray;
 use arrow::compute::concat_batches;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow::datatypes::UInt64Type;
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{Field, SchemaRef};
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
@@ -17,7 +20,7 @@ use lance_file::v2::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     pb,
@@ -38,6 +41,7 @@ use super::DISTANCE_TYPE_KEY;
 /// </section>
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
+    fn distance_all(&self) -> Vec<f32>;
     fn prefetch(&self, _id: u32) {}
 }
 
@@ -61,13 +65,52 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     where
         Self: 'a;
 
+    /// Create a [VectorStore] from a [RecordBatch].
+    /// The batch should consist of row IDs and quantized vector.
     fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>;
 
     fn as_any(&self) -> &dyn Any;
 
     fn schema(&self) -> &SchemaRef;
 
-    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>>;
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send>;
+
+    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        let batches = self
+            .to_batches()?
+            .map(|b| {
+                let mut indices = Vec::with_capacity(b.num_rows());
+                let mut new_row_ids = Vec::with_capacity(b.num_rows());
+
+                let row_ids = b.column(0).as_primitive::<UInt64Type>().values();
+                for (i, row_id) in row_ids.iter().enumerate() {
+                    match mapping.get(row_id) {
+                        Some(Some(new_id)) => {
+                            indices.push(i as u32);
+                            new_row_ids.push(*new_id);
+                        }
+                        Some(None) => {}
+                        None => {
+                            indices.push(i as u32);
+                            new_row_ids.push(*row_id);
+                        }
+                    }
+                }
+
+                let indices = UInt32Array::from(indices);
+                let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
+                let new_vectors = arrow::compute::take(b.column(1), &indices, None)?;
+
+                Ok(RecordBatch::try_new(
+                    self.schema().clone(),
+                    vec![new_row_ids, new_vectors],
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let batch = concat_batches(self.schema(), batches.iter())?;
+        Self::try_from_batch(batch, self.distance_type())
+    }
 
     fn len(&self) -> usize;
 
@@ -90,7 +133,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
-    /// Using dist calcualtor can be more efficient as it can pre-compute some
+    /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
 
@@ -216,6 +259,10 @@ impl IvfQuantizationStorage {
         Q::from_metadata(&metadata, self.distance_type)
     }
 
+    pub fn schema(&self) -> SchemaRef {
+        Arc::new(self.reader.schema().as_ref().into())
+    }
+
     /// Get the number of partitions in the storage.
     pub fn num_partitions(&self) -> usize {
         self.ivf.num_partitions()
@@ -223,21 +270,29 @@ impl IvfQuantizationStorage {
 
     pub async fn load_partition<Q: Quantization>(&self, part_id: usize) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
-        let batches = self
-            .reader
-            .read_stream(
-                ReadBatchParams::Range(range),
-                4096,
-                16,
-                FilterExpression::no_filter(),
-            )?
-            .try_collect::<Vec<_>>()
-            .await?;
-        let schema = Arc::new(self.reader.schema().as_ref().into());
-        let batch = concat_batches(&schema, batches.iter())?;
+        let batch = if range.is_empty() {
+            let schema = self.reader.schema();
+            let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
+            RecordBatch::new_empty(Arc::new(arrow_schema))
+        } else {
+            let batches = self
+                .reader
+                .read_stream(
+                    ReadBatchParams::Range(range),
+                    u32::MAX,
+                    16,
+                    FilterExpression::no_filter(),
+                )?
+                .try_collect::<Vec<_>>()
+                .await?;
+            let schema = Arc::new(self.reader.schema().as_ref().into());
+            concat_batches(&schema, batches.iter())?
+        };
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
-            self.metadata[part_id].clone(),
+            // TODO: this is a hack, cause the metadata is just the quantizer metadata
+            // it's all the same for all partitions, so now we store only one copy of it
+            self.metadata[0].clone(),
         )?;
         Q::Storage::try_from_batch(batch, self.distance_type)
     }

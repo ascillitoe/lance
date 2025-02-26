@@ -8,7 +8,7 @@ use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
-use snafu::{location, Location};
+use snafu::location;
 
 use super::{RowIdSequence, U64Segment};
 
@@ -56,7 +56,7 @@ impl RowIdIndex {
         let (row_id_segment, address_segment) = self.0.get(&row_id)?;
         let pos = row_id_segment.position(row_id)?;
         let address = address_segment.get(pos)?;
-        Some(RowAddress::new_from_id(address))
+        Some(RowAddress::from(address))
     }
 }
 

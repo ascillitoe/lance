@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use datafusion::{
     common::{stats::Precision, Statistics},
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
     scalar::ScalarValue,
 };
@@ -23,16 +24,17 @@ use lance_core::{
     },
     Error, Result, ROW_ID_FIELD,
 };
+use lance_datafusion::chunker::break_stream;
 use lance_index::{
     scalar::{
         expression::{ScalarIndexExpr, ScalarIndexLoader},
-        ScalarIndex, ScalarQuery,
+        SargableQuery, ScalarIndex,
     },
     DatasetIndexExt,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::{debug_span, instrument};
 
 use crate::{
@@ -88,7 +90,8 @@ impl ScalarIndexExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(SCALAR_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             dataset,
@@ -108,6 +111,10 @@ impl ScalarIndexExec {
 }
 
 impl ExecutionPlan for ScalarIndexExec {
+    fn name(&self) -> &str {
+        "ScalarIndexExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -116,15 +123,21 @@ impl ExecutionPlan for ScalarIndexExec {
         SCALAR_INDEX_SCHEMA.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(datafusion::error::DataFusionError::Internal(
+                "ScalarIndexExec does not have children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(
@@ -185,7 +198,8 @@ impl MapIndexExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             dataset,
@@ -205,7 +219,10 @@ impl MapIndexExec {
         let index_vals = (0..index_vals.len())
             .map(|idx| ScalarValue::try_from_array(index_vals, idx))
             .collect::<datafusion::error::Result<Vec<_>>>()?;
-        let query = ScalarIndexExpr::Query(column_name.clone(), ScalarQuery::IsIn(index_vals));
+        let query = ScalarIndexExpr::Query(
+            column_name.clone(),
+            Arc::new(SargableQuery::IsIn(index_vals)),
+        );
         let mut row_addresses = query.evaluate(dataset.as_ref()).await?;
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
@@ -265,6 +282,10 @@ impl MapIndexExec {
 }
 
 impl ExecutionPlan for MapIndexExec {
+    fn name(&self) -> &str {
+        "MapIndexExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -273,15 +294,25 @@ impl ExecutionPlan for MapIndexExec {
         INDEX_LOOKUP_SCHEMA.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        unimplemented!()
+        if children.len() != 1 {
+            Err(datafusion::error::DataFusionError::Internal(
+                "MapIndexExec requires exactly one child".to_string(),
+            ))
+        } else {
+            Ok(Arc::new(Self::new(
+                self.dataset.clone(),
+                self.column_name.clone(),
+                children.into_iter().next().unwrap(),
+            )))
+        }
     }
 
     fn execute(
@@ -350,7 +381,7 @@ impl<'a> FragIdIter<'a> {
     }
 }
 
-impl<'a> Iterator for FragIdIter<'a> {
+impl Iterator for FragIdIter<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -382,7 +413,8 @@ impl MaterializeIndexExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(MATERIALIZE_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             dataset,
@@ -398,7 +430,6 @@ impl MaterializeIndexExec {
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
     ) -> Result<RecordBatch> {
-        // TODO: multiple batches, stream without materializing all row ids in memory
         let mask = expr.evaluate(dataset.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
@@ -534,6 +565,10 @@ async fn retain_fragments(
 }
 
 impl ExecutionPlan for MaterializeIndexExec {
+    fn name(&self) -> &str {
+        "MaterializeIndexExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -542,15 +577,21 @@ impl ExecutionPlan for MaterializeIndexExec {
         MATERIALIZE_INDEX_SCHEMA.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(datafusion::error::DataFusionError::Internal(
+                "MaterializeIndexExec does not have children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(
@@ -567,9 +608,14 @@ impl ExecutionPlan for MaterializeIndexExec {
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
             MATERIALIZE_INDEX_SCHEMA.clone(),
             stream,
+        ));
+        let stream = break_stream(stream, 64 * 1024);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            MATERIALIZE_INDEX_SCHEMA.clone(),
+            stream.map_err(|err| err.into()),
         )))
     }
 

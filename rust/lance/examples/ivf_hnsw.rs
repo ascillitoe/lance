@@ -4,11 +4,12 @@
 //! Run recall benchmarks for HNSW.
 //!
 //! run with `cargo run --release --example hnsw`
-
+#![allow(clippy::print_stdout)]
 use arrow::array::AsArray;
 use arrow_array::types::Float32Type;
 use clap::Parser;
 use futures::TryStreamExt;
+use lance::dataset::ProjectionRequest;
 use lance::index::vector::VectorIndexParams;
 use lance::Dataset;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -96,8 +97,10 @@ async fn main() {
 
     println!("Loaded {} records", dataset.count_rows(None).await.unwrap());
 
+    let take_projection = ProjectionRequest::from_columns([column], dataset.schema());
+
     let q = dataset
-        .take(&[0], &dataset.schema().project(&[column]).unwrap())
+        .take(&[0], take_projection)
         .await
         .unwrap()
         .column(0)

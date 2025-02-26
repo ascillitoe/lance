@@ -17,6 +17,7 @@ mod test {
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use datafusion::execution::SendableRecordBatchStream;
     use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::ivf::storage::IvfModel;
@@ -138,8 +139,12 @@ mod test {
             todo!("this method is for only IVF_HNSW_* index");
         }
 
-        fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
             Ok(())
+        }
+
+        async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
+            unimplemented!("only for SubIndex")
         }
 
         fn ivf_model(&self) -> IvfModel {
@@ -233,6 +238,8 @@ mod test {
                 column: "test".to_string(),
                 key: Arc::new(Float32Array::from(query)),
                 k: 1,
+                lower_bound: None,
+                upper_bound: None,
                 nprobes: 1,
                 ef: None,
                 refine_factor: None,

@@ -2,15 +2,100 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::sync::{Arc, Mutex};
 
-use arrow_array::RecordBatch;
+use arrow::array::AsArray;
+use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
+use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
-use lance_core::utils::futures::{Capacity, SharedStream, SharedStreamExt};
+use lance_core::utils::futures::{Capacity, SharedStreamExt};
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
+use lance_core::{Result, ROW_ID};
+use lance_index::prefilter::FilterLoader;
+use snafu::location;
+
+#[derive(Debug, Clone)]
+pub enum PreFilterSource {
+    /// The prefilter input is an array of row ids that match the filter condition
+    FilteredRowIds(Arc<dyn ExecutionPlan>),
+    /// The prefilter input is a selection vector from an index query
+    ScalarIndexQuery(Arc<dyn ExecutionPlan>),
+    // The prefilter input is provided directly as a RowIdMask
+    ProvidedRowIds(RowIdMask),
+    /// There is no prefilter
+    None,
+}
+
+// Utility to convert an input (containing row ids) into a prefilter
+pub(crate) struct FilteredRowIdsToPrefilter(pub SendableRecordBatchStream);
+
+#[async_trait]
+impl FilterLoader for FilteredRowIdsToPrefilter {
+    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
+        let mut allow_list = RowIdTreeMap::new();
+        while let Some(batch) = self.0.next().await {
+            let batch = batch?;
+            let row_ids = batch.column_by_name(ROW_ID).expect(
+                "input batch missing row id column even though it is in the schema for the stream",
+            );
+            let row_ids = row_ids
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("row id column in input batch had incorrect type");
+            allow_list.extend(row_ids.iter().flatten())
+        }
+        Ok(RowIdMask::from_allowed(allow_list))
+    }
+}
+
+// Utility to convert a serialized selection vector into a prefilter
+pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
+
+#[async_trait]
+impl FilterLoader for SelectionVectorToPrefilter {
+    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
+        let batch = self
+            .0
+            .try_next()
+            .await?
+            .ok_or_else(|| Error::Internal {
+                message: "Selection vector source for prefilter did not yield any batches".into(),
+                location: location!(),
+            })
+            .unwrap();
+        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
+            Error::Internal {
+                message: format!(
+                    "Expected selection vector input to yield binary arrays but got {}",
+                    batch["result"].data_type()
+                ),
+                location: location!(),
+            }
+        })?)
+    }
+}
+
+// Utility to convert a provided row id mask into a prefilter
+pub(crate) struct DirectRowIdFilterLoader {
+    row_id_mask: RowIdMask,
+}
+
+impl DirectRowIdFilterLoader {
+    pub fn new(row_id_mask: RowIdMask) -> Self {
+        Self { row_id_mask }
+    }
+}
+
+#[async_trait]
+impl FilterLoader for DirectRowIdFilterLoader {
+    async fn load(self: Box<Self>) -> Result<RowIdMask> {
+        Ok(self.row_id_mask)
+    }
+}
 
 struct InnerState {
     cached: Option<SendableRecordBatchStream>,
@@ -74,7 +159,7 @@ impl DisplayAs for ReplayExec {
 // for that shared stream to be a SendableRecordBatchStream, it needs to be
 // using DataFusionError.  So we need to adapt the stream back to a
 // SendableRecordBatchStream.
-struct ShareableRecordBatchStream(SendableRecordBatchStream);
+pub struct ShareableRecordBatchStream(pub SendableRecordBatchStream);
 
 impl Stream for ShareableRecordBatchStream {
     type Item = CloneableResult<RecordBatch>;
@@ -93,12 +178,21 @@ impl Stream for ShareableRecordBatchStream {
     }
 }
 
-struct ShareableRecordBatchStreamAdapter {
+pub struct ShareableRecordBatchStreamAdapter<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin>
+{
     schema: SchemaRef,
-    stream: SharedStream<'static, CloneableResult<RecordBatch>>,
+    stream: S,
 }
 
-impl Stream for ShareableRecordBatchStreamAdapter {
+impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> ShareableRecordBatchStreamAdapter<S> {
+    pub fn new(schema: SchemaRef, stream: S) -> Self {
+        Self { schema, stream }
+    }
+}
+
+impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> Stream
+    for ShareableRecordBatchStreamAdapter<S>
+{
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(
@@ -116,13 +210,19 @@ impl Stream for ShareableRecordBatchStreamAdapter {
     }
 }
 
-impl RecordBatchStream for ShareableRecordBatchStreamAdapter {
+impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> RecordBatchStream
+    for ShareableRecordBatchStreamAdapter<S>
+{
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 }
 
 impl ExecutionPlan for ReplayExec {
+    fn name(&self) -> &str {
+        "ReplayExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -131,8 +231,8 @@ impl ExecutionPlan for ReplayExec {
         self.input.schema()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -156,7 +256,7 @@ impl ExecutionPlan for ReplayExec {
             Ok(cached)
         } else {
             let input = self.input.execute(partition, context)?;
-            let schema = input.schema().clone();
+            let schema = input.schema();
             let input = ShareableRecordBatchStream(input);
             let (to_return, to_cache) = input.boxed().share(self.capacity);
             inner_state.cached = Some(Box::pin(ShareableRecordBatchStreamAdapter {
@@ -201,7 +301,7 @@ mod tests {
         let data = lance_datagen::gen()
             .col("x", array::step::<UInt32Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(16));
-        let schema = data.schema().clone();
+        let schema = data.schema();
         let data = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             futures::stream::iter(data).map_err(datafusion::error::DataFusionError::from),

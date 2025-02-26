@@ -9,7 +9,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::IndexType;
 use lance_table::format::Index as IndexMetadata;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use uuid::Uuid;
 
 use super::vector::ivf::optimize_vector_indices;
@@ -35,7 +35,7 @@ pub async fn merge_indices<'a>(
 ) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, RoaringBitmap)>> {
     if old_indices.is_empty() {
         return Err(Error::Index {
-            message: "Append index: no prevoius index found".to_string(),
+            message: "Append index: no previous index found".to_string(),
             location: location!(),
         });
     };
@@ -71,38 +71,50 @@ pub async fn merge_indices<'a>(
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
 
     let mut frag_bitmap = RoaringBitmap::new();
-    old_indices.iter().for_each(|idx| {
-        frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-    });
     unindexed.iter().for_each(|frag| {
         frag_bitmap.insert(frag.id as u32);
     });
 
     let (new_uuid, indices_merged) = match indices[0].index_type() {
-        IndexType::Scalar => {
+        it if it.is_scalar() => {
+            // There are no delta indices for scalar, so adding all indexed
+            // fragments to the new index.
+            old_indices.iter().for_each(|idx| {
+                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+            });
+
             let index = dataset
                 .open_scalar_index(&column.name, &old_indices[0].uuid.to_string())
                 .await?;
 
             let mut scanner = dataset.scan();
+            let orodering = match index.index_type() {
+                IndexType::Inverted => None,
+                _ => Some(vec![ColumnOrdering::asc_nulls_first(column.name.clone())]),
+            };
             scanner
                 .with_fragments(unindexed)
                 .with_row_id()
-                .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                    column.name.clone(),
-                )]))?
+                .order_by(orodering)?
                 .project(&[&column.name])?;
             let new_data_stream = scanner.try_into_stream().await?;
 
             let new_uuid = Uuid::new_v4();
 
             let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
-
             index.update(new_data_stream.into(), &new_store).await?;
 
             Ok((new_uuid, 1))
         }
-        IndexType::Vector => {
+        it if it.is_vector() => {
+            let start_pos = old_indices
+                .len()
+                .saturating_sub(options.num_indices_to_merge);
+            let indices_to_merge = &old_indices[start_pos..];
+            indices_to_merge.iter().for_each(|idx| {
+                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+            });
+
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
@@ -111,6 +123,9 @@ pub async fn merge_indices<'a>(
                     .with_fragments(unindexed)
                     .with_row_id()
                     .project(&[&column.name])?;
+                if column.nullable {
+                    scanner.filter_expr(datafusion_expr::col(&column.name).is_not_null());
+                }
                 Some(scanner.try_into_stream().await?)
             };
 
@@ -123,6 +138,13 @@ pub async fn merge_indices<'a>(
             )
             .await
         }
+        _ => Err(Error::Index {
+            message: format!(
+                "Append index: invalid index type: {:?}",
+                indices[0].index_type()
+            ),
+            location: location!(),
+        }),
     }?;
 
     Ok(Some((
@@ -136,18 +158,22 @@ pub async fn merge_indices<'a>(
 mod tests {
     use super::*;
 
+    use arrow::datatypes::Float32Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::UInt32Type;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
-        DatasetIndexExt,
+        DatasetIndexExt, IndexType,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
+    use rstest::rstest;
     use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -206,7 +232,9 @@ mod tests {
 
         let q = array.value(5);
         let mut scanner = dataset.scan();
-        scanner.nearest("vector", q.as_primitive(), 10).unwrap();
+        scanner
+            .nearest("vector", q.as_primitive::<Float32Type>(), 10)
+            .unwrap();
         let results = scanner
             .try_into_stream()
             .await
@@ -238,7 +266,9 @@ mod tests {
         assert_eq!(index_dirs.len(), 2);
 
         let mut scanner = dataset.scan();
-        scanner.nearest("vector", q.as_primitive(), 10).unwrap();
+        scanner
+            .nearest("vector", q.as_primitive::<Float32Type>(), 10)
+            .unwrap();
         let results = scanner
             .try_into_stream()
             .await
@@ -274,10 +304,21 @@ mod tests {
         assert_eq!(row_in_index, 2000);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_query_delta_indices() {
+    async fn test_query_delta_indices(
+        #[values(
+            VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 2),
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                SQBuildParams::default()
+            )
+        )]
+        index_params: VectorIndexParams,
+    ) {
         const DIM: usize = 64;
-        const IVF_PARTITIONS: usize = 2;
         const TOTAL: usize = 1000;
 
         let test_dir = tempdir().unwrap();
@@ -309,20 +350,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
         dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                None,
-                &VectorIndexParams::with_ivf_pq_params(
-                    MetricType::L2,
-                    IvfBuildParams::new(IVF_PARTITIONS),
-                    PQBuildParams {
-                        num_sub_vectors: 2,
-                        ..Default::default()
-                    },
-                ),
-                true,
-            )
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, true)
             .await
             .unwrap();
         let stats: serde_json::Value =
@@ -353,6 +381,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -367,8 +396,9 @@ mod tests {
             .scan()
             .project(&["id"])
             .unwrap()
-            .nearest("vector", array.value(0).as_primitive(), 2)
+            .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 2)
             .unwrap()
+            .refine(1)
             .try_into_batch()
             .await
             .unwrap();

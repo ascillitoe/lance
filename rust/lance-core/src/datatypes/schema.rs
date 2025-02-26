@@ -4,18 +4,19 @@
 //! Schema
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug, Formatter},
+    sync::Arc,
 };
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use deepsize::DeepSizeOf;
 use lance_arrow::*;
-use snafu::{location, Location};
+use snafu::location;
 
-use super::field::{Field, SchemaCompareOptions};
-use crate::{Error, Result};
+use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
+use crate::{Error, Result, ROW_ADDR, ROW_ID};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -60,15 +61,8 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 
 impl Schema {
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
-        if self.fields.len() != expected.fields.len() {
-            false
-        } else {
-            self.fields
-                .iter()
-                .zip(&expected.fields)
-                .all(|(lhs, rhs)| lhs.compare_with_options(rhs, options))
-                && (!options.compare_metadata || self.metadata == expected.metadata)
-        }
+        compare_fields(&self.fields, &expected.fields, options)
+            && (!options.compare_metadata || self.metadata == expected.metadata)
     }
 
     pub fn explain_difference(
@@ -76,70 +70,63 @@ impl Schema {
         expected: &Self,
         options: &SchemaCompareOptions,
     ) -> Option<String> {
-        if self.fields.len() != expected.fields.len()
-            || !self
-                .fields
-                .iter()
-                .zip(expected.fields.iter())
-                .all(|(field, expected)| field.name == expected.name)
-        {
-            let self_fields = self
-                .fields
-                .iter()
-                .map(|f| f.name.clone())
-                .collect::<HashSet<_>>();
-            let expected_fields = expected
-                .fields
-                .iter()
-                .map(|f| f.name.clone())
-                .collect::<HashSet<_>>();
-            let missing = expected_fields
-                .difference(&self_fields)
-                .cloned()
-                .collect::<Vec<_>>();
-            let unexpected = self_fields
-                .difference(&expected_fields)
-                .cloned()
-                .collect::<Vec<_>>();
-            if missing.is_empty() && unexpected.is_empty() {
-                Some(format!(
-                    "fields in different order, expected: [{}], actual: [{}]",
-                    expected
-                        .fields
-                        .iter()
-                        .map(|f| f.name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    self.fields
-                        .iter()
-                        .map(|f| f.name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ))
-            } else {
-                Some(format!(
-                    "fields did not match, missing=[{}], unexpected=[{}]",
-                    missing.join(", "),
-                    unexpected.join(", ")
-                ))
-            }
-        } else {
-            let differences = self
-                .fields
-                .iter()
-                .zip(expected.fields.iter())
-                .flat_map(|(field, expected)| field.explain_difference(expected, options))
-                .collect::<Vec<_>>();
-            if differences.is_empty() {
-                if options.compare_metadata && self.metadata != expected.metadata {
-                    Some("schema metadata did not match expected schema metadata".to_string())
-                } else {
-                    None
-                }
-            } else {
-                Some(differences.join(", "))
+        let mut differences =
+            explain_fields_difference(&self.fields, &expected.fields, options, None);
+
+        if options.compare_metadata {
+            if let Some(difference) =
+                explain_metadata_difference(&self.metadata, &expected.metadata)
+            {
+                differences.push(difference);
             }
         }
+
+        if differences.is_empty() {
+            None
+        } else {
+            Some(differences.join(", "))
+        }
+    }
+
+    pub fn retain_storage_class(&self, storage_class: StorageClass) -> Self {
+        let fields = self
+            .fields
+            .iter()
+            .filter(|f| f.storage_class() == storage_class)
+            .cloned()
+            .collect();
+        Self {
+            fields,
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    /// Splits the schema into two schemas, one with default storage class fields and the other with blob storage class fields.
+    /// If there are no blob storage class fields, the second schema will be `None`.
+    /// The order of fields is preserved.
+    pub fn partition_by_storage_class(&self) -> (Self, Option<Self>) {
+        let mut local_fields = Vec::with_capacity(self.fields.len());
+        let mut sibling_fields = Vec::with_capacity(self.fields.len());
+        for field in self.fields.iter() {
+            match field.storage_class() {
+                StorageClass::Default => local_fields.push(field.clone()),
+                StorageClass::Blob => sibling_fields.push(field.clone()),
+            }
+        }
+        (
+            Self {
+                fields: local_fields,
+                metadata: self.metadata.clone(),
+            },
+            if sibling_fields.is_empty() {
+                None
+            } else {
+                Some(Self {
+                    fields: sibling_fields,
+                    metadata: self.metadata.clone(),
+                })
+            },
+        )
     }
 
     pub fn has_dictionary_types(&self) -> bool {
@@ -159,13 +146,34 @@ impl Schema {
         }
     }
 
-    /// Project the columns over the schema.
+    /// Convert to a compact string representation.
     ///
-    /// ```ignore
-    /// let schema = Schema::from(...);
-    /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
-    /// ```
-    pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+    /// This is intended for display purposes and not for serialization.
+    pub fn to_compact_string(&self, indent: Indentation) -> String {
+        ArrowSchema::from(self).to_compact_string(indent)
+    }
+
+    /// Given a string column reference, resolve the path of fields
+    ///
+    /// For example, given a.b.c we will return the fields [a, b, c]
+    ///
+    /// Returns None if we can't find a segment at any point
+    pub fn resolve(&self, column: impl AsRef<str>) -> Option<Vec<&Field>> {
+        let mut split = column.as_ref().split('.').collect::<VecDeque<_>>();
+        let mut fields = Vec::with_capacity(split.len());
+        let first = split.pop_front().unwrap();
+        if let Some(field) = self.field(first) {
+            if field.resolve(&mut split, &mut fields) {
+                Some(fields)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn do_project<T: AsRef<str>>(&self, columns: &[T], err_on_missing: bool) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
             let split = col.as_ref().split('.').collect::<Vec<_>>();
@@ -177,7 +185,7 @@ impl Schema {
                 } else {
                     candidates.push(projected_field)
                 }
-            } else {
+            } else if err_on_missing {
                 return Err(Error::Schema {
                     message: format!("Column {} does not exist", col.as_ref()),
                     location: location!(),
@@ -189,6 +197,21 @@ impl Schema {
             fields: candidates,
             metadata: self.metadata.clone(),
         })
+    }
+
+    /// Project the columns over the schema.
+    ///
+    /// ```ignore
+    /// let schema = Schema::from(...);
+    /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
+    /// ```
+    pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+        self.do_project(columns, true)
+    }
+
+    /// Project the columns over the schema, dropping unrecognized columns
+    pub fn project_or_drop<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+        self.do_project(columns, false)
     }
 
     /// Check that the top level fields don't contain `.` in their names
@@ -245,10 +268,19 @@ impl Schema {
 
     /// Intersection between two [`Schema`].
     pub fn intersection(&self, other: &Self) -> Result<Self> {
+        self.do_intersection(other, false)
+    }
+
+    /// Intersection between two [`Schema`], ignoring data types.
+    pub fn intersection_ignore_types(&self, other: &Self) -> Result<Self> {
+        self.do_intersection(other, true)
+    }
+
+    fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for field in other.fields.iter() {
             if let Some(candidate_field) = self.field(&field.name) {
-                candidates.push(candidate_field.intersection(field)?);
+                candidates.push(candidate_field.do_intersection(field, ignore_types)?);
             }
         }
 
@@ -269,11 +301,16 @@ impl Schema {
     /// Returns a new schema that only contains the fields in `column_ids`.
     ///
     /// This projection can filter out both top-level and nested fields
-    pub fn project_by_ids(&self, column_ids: &[i32]) -> Self {
+    ///
+    /// If `include_all_children` is true, then if a parent field id is passed,
+    /// then all children of that field will be included in the projection
+    /// regardless of whether their ids were passed. If this is false, then
+    /// only the child fields with the passed ids will be included.
+    pub fn project_by_ids(&self, column_ids: &[i32], include_all_children: bool) -> Self {
         let filtered_fields = self
             .fields
             .iter()
-            .filter_map(|f| f.project_by_ids(column_ids))
+            .filter_map(|f| f.project_by_ids(column_ids, include_all_children))
             .collect();
         Self {
             fields: filtered_fields,
@@ -288,13 +325,15 @@ impl Schema {
     pub fn project_by_schema<S: TryInto<Self, Error = Error>>(
         &self,
         projection: S,
+        on_missing: OnMissing,
+        on_type_mismatch: OnTypeMismatch,
     ) -> Result<Self> {
         let projection = projection.try_into()?;
         let mut new_fields = vec![];
         for field in projection.fields.iter() {
             if let Some(self_field) = self.field(&field.name) {
-                new_fields.push(self_field.project_by_field(field)?);
-            } else {
+                new_fields.push(self_field.project_by_field(field, on_type_mismatch)?);
+            } else if matches!(on_missing, OnMissing::Error) {
                 return Err(Error::Schema {
                     message: format!("Field {} not found", field.name),
                     location: location!(),
@@ -361,7 +400,19 @@ impl Schema {
     }
 
     /// Get field by its id.
-    // TODO: pub(crate)
+    pub fn field_by_id_mut(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
+        let id = id.into();
+        for field in self.fields.iter_mut() {
+            if field.id == id {
+                return Some(field);
+            }
+            if let Some(grandchild) = field.field_by_id_mut(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
+
     pub fn field_by_id(&self, id: impl Into<i32>) -> Option<&Field> {
         let id = id.into();
         for field in self.fields.iter() {
@@ -511,6 +562,10 @@ impl Schema {
         };
         Ok(schema)
     }
+
+    pub fn all_fields_nullable(&self) -> bool {
+        SchemaFieldIterPreOrder::new(self).all(|f| f.nullable)
+    }
 }
 
 impl PartialEq for Schema {
@@ -563,6 +618,404 @@ impl TryFrom<&Self> for Schema {
 
     fn try_from(schema: &Self) -> Result<Self> {
         Ok(schema.clone())
+    }
+}
+
+pub fn compare_fields(
+    fields: &[Field],
+    expected: &[Field],
+    options: &SchemaCompareOptions,
+) -> bool {
+    if options.allow_missing_if_nullable || options.ignore_field_order {
+        let expected_names = expected
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<HashSet<_>>();
+        for field in fields {
+            if !expected_names.contains(field.name.as_str()) {
+                // Extra field
+                return false;
+            }
+        }
+
+        let field_mapping = fields
+            .iter()
+            .enumerate()
+            .map(|(pos, f)| (f.name.as_str(), (f, pos)))
+            .collect::<HashMap<_, _>>();
+        let mut cumulative_position = 0;
+        for expected_field in expected {
+            if let Some((field, pos)) = field_mapping.get(expected_field.name.as_str()) {
+                if !field.compare_with_options(expected_field, options) {
+                    return false;
+                }
+                if !options.ignore_field_order && *pos < cumulative_position {
+                    return false;
+                }
+                cumulative_position = *pos;
+            } else if options.allow_missing_if_nullable && expected_field.nullable {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        true
+    } else {
+        // Fast path: we can just zip
+        fields.len() == expected.len()
+            && fields
+                .iter()
+                .zip(expected.iter())
+                .all(|(lhs, rhs)| lhs.compare_with_options(rhs, options))
+    }
+}
+
+pub fn explain_fields_difference(
+    fields: &[Field],
+    expected: &[Field],
+    options: &SchemaCompareOptions,
+    path: Option<&str>,
+) -> Vec<String> {
+    let field_names = fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect::<HashSet<_>>();
+    let expected_names = expected
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect::<HashSet<_>>();
+
+    let prepend_path = |f: &str| {
+        if let Some(path) = path {
+            format!("{}.{}", path, f)
+        } else {
+            f.to_string()
+        }
+    };
+
+    // Check there are no extra fields or missing fields
+    let unexpected_fields = field_names
+        .difference(&expected_names)
+        .cloned()
+        .map(prepend_path)
+        .collect::<Vec<_>>();
+    let missing_fields = expected_names.difference(&field_names);
+    let missing_fields = if options.allow_missing_if_nullable {
+        missing_fields
+            .filter(|f| {
+                let expected_field = expected.iter().find(|ef| ef.name == **f).unwrap();
+                !expected_field.nullable
+            })
+            .cloned()
+            .map(prepend_path)
+            .collect::<Vec<_>>()
+    } else {
+        missing_fields
+            .cloned()
+            .map(prepend_path)
+            .collect::<Vec<_>>()
+    };
+
+    let mut differences = vec![];
+    if !missing_fields.is_empty() || !unexpected_fields.is_empty() {
+        differences.push(format!(
+            "fields did not match, missing=[{}], unexpected=[{}]",
+            missing_fields.join(", "),
+            unexpected_fields.join(", ")
+        ));
+    }
+
+    // Map the expected fields to position of field
+    let field_mapping = expected
+        .iter()
+        .filter_map(|ef| {
+            fields
+                .iter()
+                .position(|f| ef.name == f.name)
+                .map(|pos| (ef, pos))
+        })
+        .collect::<Vec<_>>();
+
+    // Check the fields are in the same order
+    if !options.ignore_field_order {
+        let fields_out_of_order = field_mapping.windows(2).any(|w| w[0].1 > w[1].1);
+        if fields_out_of_order {
+            let expected_order = expected.iter().map(|f| f.name.as_str()).collect::<Vec<_>>();
+            let actual_order = fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>();
+            differences.push(format!(
+                "fields in different order, expected: [{}], actual: [{}]",
+                expected_order.join(", "),
+                actual_order.join(", ")
+            ));
+        }
+    }
+
+    // Check for individual differences in the fields
+    for (expected_field, field_pos) in field_mapping.iter() {
+        let field = &fields[*field_pos];
+        debug_assert_eq!(field.name, expected_field.name);
+        let field_diffs = field.explain_differences(expected_field, options, path);
+        if !field_diffs.is_empty() {
+            differences.push(field_diffs.join(", "))
+        }
+    }
+
+    differences
+}
+
+fn explain_metadata_difference(
+    metadata: &HashMap<String, String>,
+    expected: &HashMap<String, String>,
+) -> Option<String> {
+    if metadata != expected {
+        Some(format!(
+            "metadata did not match, expected: {:?}, actual: {:?}",
+            expected, metadata
+        ))
+    } else {
+        None
+    }
+}
+
+/// What to do when a column is missing in the schema
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnMissing {
+    Error,
+    Ignore,
+}
+
+/// A trait for something that we can project fields from.
+pub trait Projectable: Debug + Send + Sync {
+    fn schema(&self) -> &Schema;
+}
+
+impl Projectable for Schema {
+    fn schema(&self) -> &Schema {
+        self
+    }
+}
+
+/// A projection is a selection of fields in a schema
+///
+/// In addition we record whether the row_id or row_addr are
+/// selected (these fields have no field id)
+#[derive(Clone)]
+pub struct Projection {
+    base: Arc<dyn Projectable>,
+    pub field_ids: HashSet<i32>,
+    pub with_row_id: bool,
+    pub with_row_addr: bool,
+}
+
+impl Debug for Projection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Projection")
+            .field("schema", &self.to_schema())
+            .field("with_row_id", &self.with_row_id)
+            .field("with_row_addr", &self.with_row_addr)
+            .finish()
+    }
+}
+
+impl Projection {
+    /// Create a new empty projection
+    pub fn empty(base: Arc<dyn Projectable>) -> Self {
+        Self {
+            base,
+            field_ids: HashSet::new(),
+            with_row_id: false,
+            with_row_addr: false,
+        }
+    }
+
+    /// Add a column (and any of its parents) to the projection from a string reference
+    pub fn union_column(mut self, column: impl AsRef<str>, on_missing: OnMissing) -> Result<Self> {
+        let column = column.as_ref();
+        if column == ROW_ID {
+            self.with_row_id = true;
+            return Ok(self);
+        } else if column == ROW_ADDR {
+            self.with_row_addr = true;
+            return Ok(self);
+        }
+
+        if let Some(fields) = self.base.schema().resolve(column) {
+            self.field_ids.extend(fields.iter().map(|f| f.id));
+        } else if matches!(on_missing, OnMissing::Error) {
+            return Err(Error::InvalidInput {
+                source: format!("Column {} does not exist", column).into(),
+                location: location!(),
+            });
+        }
+        Ok(self)
+    }
+
+    /// True if the projection selects the given field id
+    pub fn contains_field_id(&self, id: i32) -> bool {
+        self.field_ids.contains(&id)
+    }
+
+    /// Add multiple columns (and their parents) to the projection
+    pub fn union_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl AsRef<str>>,
+        on_missing: OnMissing,
+    ) -> Result<Self> {
+        for column in columns {
+            self = self.union_column(column, on_missing)?;
+        }
+        Ok(self)
+    }
+
+    /// Adds all fields from the base schema satisfying a predicate
+    pub fn union_predicate(mut self, predicate: impl Fn(&Field) -> bool) -> Self {
+        for field in self.base.schema().fields_pre_order() {
+            if predicate(field) {
+                self.field_ids.insert(field.id);
+            }
+        }
+        self
+    }
+
+    /// Removes all fields in the base schema satisfying a predicate
+    pub fn subtract_predicate(mut self, predicate: impl Fn(&Field) -> bool) -> Self {
+        for field in self.base.schema().fields_pre_order() {
+            if predicate(field) {
+                self.field_ids.remove(&field.id);
+            }
+        }
+        self
+    }
+
+    /// Creates a new projection that is the intersection of this projection and another
+    pub fn intersect(mut self, other: &Self) -> Self {
+        self.field_ids = HashSet::from_iter(self.field_ids.intersection(&other.field_ids).copied());
+        self.with_row_id = self.with_row_id && other.with_row_id;
+        self.with_row_addr = self.with_row_addr && other.with_row_addr;
+        self
+    }
+
+    /// Adds all fields from the provided schema to the projection
+    ///
+    /// Fields are only added if they exist in the base schema, otherwise they
+    /// are ignored.
+    ///
+    /// Will panic if a field in the given schema has a non-negative id and is not in the base schema.
+    pub fn union_schema(mut self, other: &Schema) -> Self {
+        for field in other.fields_pre_order() {
+            if field.id >= 0 {
+                self.field_ids.insert(field.id);
+            } else if field.name == ROW_ID {
+                self.with_row_id = true;
+            } else if field.name == ROW_ADDR {
+                self.with_row_addr = true;
+            } else {
+                // If a field is not in our schema then it should probably have an id of -1.  If it isn't -1
+                // that probably implies some kind of weird schema mixing is going on and we should panic.
+                debug_assert_eq!(field.id, -1);
+            }
+        }
+        self
+    }
+
+    /// Creates a new projection that is the union of this projection and another
+    pub fn union_projection(mut self, other: &Self) -> Self {
+        self.field_ids.extend(&other.field_ids);
+        self.with_row_id = self.with_row_id || other.with_row_id;
+        self.with_row_addr = self.with_row_addr || other.with_row_addr;
+        self
+    }
+
+    /// Adds all fields from the given schema to the projection
+    ///
+    /// on_missing controls what happen to fields that are not in the base schema
+    ///
+    /// Name based matching is used to determine if a field is in the base schema.
+    pub fn union_arrow_schema(
+        mut self,
+        other: &ArrowSchema,
+        on_missing: OnMissing,
+    ) -> Result<Self> {
+        self.with_row_id |= other.fields().iter().any(|f| f.name() == ROW_ID);
+        self.with_row_addr |= other.fields().iter().any(|f| f.name() == ROW_ADDR);
+        let other =
+            self.base
+                .schema()
+                .project_by_schema(other, on_missing, OnTypeMismatch::TakeSelf)?;
+        Ok(self.union_schema(&other))
+    }
+
+    /// Removes all fields from the projection that are in the given schema
+    ///
+    /// on_missing controls what happen to fields that are not in the base schema
+    ///
+    /// Name based matching is used to determine if a field is in the base schema.
+    pub fn subtract_arrow_schema(
+        mut self,
+        other: &ArrowSchema,
+        on_missing: OnMissing,
+    ) -> Result<Self> {
+        self.with_row_id &= !other.fields().iter().any(|f| f.name() == ROW_ID);
+        self.with_row_addr &= !other.fields().iter().any(|f| f.name() == ROW_ADDR);
+        let other =
+            self.base
+                .schema()
+                .project_by_schema(other, on_missing, OnTypeMismatch::TakeSelf)?;
+        Ok(self.subtract_schema(&other))
+    }
+
+    /// Removes all fields from this projection that are present in the given projection
+    pub fn subtract_projection(mut self, other: &Self) -> Self {
+        self.field_ids = self
+            .field_ids
+            .difference(&other.field_ids)
+            .copied()
+            .collect();
+        self.with_row_addr = self.with_row_addr && !other.with_row_addr;
+        self.with_row_id = self.with_row_id && !other.with_row_id;
+        self
+    }
+
+    /// Removes all fields from the projection that are in the given schema
+    ///
+    /// Fields are only removed if they exist in the base schema, otherwise they
+    /// are ignored.
+    ///
+    /// Will panic if a field in the given schema has a non-negative id and is not in the base schema.
+    pub fn subtract_schema(mut self, other: &Schema) -> Self {
+        for field in other.fields_pre_order() {
+            if field.id >= 0 {
+                self.field_ids.remove(&field.id);
+            } else if field.name == ROW_ID {
+                self.with_row_id = false;
+            } else if field.name == ROW_ADDR {
+                self.with_row_addr = false;
+            } else {
+                debug_assert_eq!(field.id, -1);
+            }
+        }
+        self
+    }
+
+    /// True if the projection does not select any fields
+    pub fn is_empty(&self) -> bool {
+        self.field_ids.is_empty()
+    }
+
+    /// Convert the projection to a schema
+    pub fn to_schema(&self) -> Schema {
+        let field_ids = self.field_ids.iter().copied().collect::<Vec<_>>();
+        self.base.schema().project_by_ids(&field_ids, false)
+    }
+
+    /// Convert the projection to a schema
+    pub fn into_schema(self) -> Schema {
+        self.to_schema()
+    }
+
+    /// Convert the projection to a schema reference
+    pub fn into_schema_ref(self) -> Arc<Schema> {
+        Arc::new(self.into_schema())
     }
 }
 
@@ -625,7 +1078,7 @@ mod tests {
         ]);
         let mut schema = Schema::try_from(&arrow_schema).unwrap();
         schema.set_field_id(None);
-        let projected = schema.project_by_ids(&[2, 4, 5]);
+        let projected = schema.project_by_ids(&[2, 4, 5], true);
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
@@ -640,7 +1093,7 @@ mod tests {
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
 
-        let projected = schema.project_by_ids(&[2]);
+        let projected = schema.project_by_ids(&[2], true);
         let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "b",
             DataType::Struct(ArrowFields::from(vec![ArrowField::new(
@@ -652,7 +1105,7 @@ mod tests {
         )]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
 
-        let projected = schema.project_by_ids(&[1]);
+        let projected = schema.project_by_ids(&[1], true);
         let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "b",
             DataType::Struct(ArrowFields::from(vec![
@@ -660,6 +1113,18 @@ mod tests {
                 ArrowField::new("f2", DataType::Boolean, false),
                 ArrowField::new("f3", DataType::Float32, false),
             ])),
+            true,
+        )]);
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+
+        let projected = schema.project_by_ids(&[1, 2], false);
+        let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "f1",
+                DataType::Utf8,
+                true,
+            )])),
             true,
         )]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
@@ -725,7 +1190,9 @@ mod tests {
                 false,
             ),
         ]);
-        let projected = schema.project_by_schema(&projection).unwrap();
+        let projected = schema
+            .project_by_schema(&projection, OnMissing::Error, OnTypeMismatch::TakeSelf)
+            .unwrap();
 
         assert_eq!(ArrowSchema::from(&projected), projection);
     }
@@ -1030,6 +1497,189 @@ mod tests {
         ]);
         let mismatched = Schema::try_from(&mismatched).unwrap();
 
-        assert_eq!(mismatched.explain_difference(&expected, &SchemaCompareOptions::default()), Some("`b` had mismatched children, missing=[f2] unexpected=[], `c` should have nullable=false but nullable=true".to_string()));
+        assert_eq!(
+            mismatched.explain_difference(&expected, &SchemaCompareOptions::default()),
+            Some(
+                "`b` had mismatched children: fields did not match, missing=[b.f2], \
+                  unexpected=[], `c` should have nullable=false but nullable=true"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_schema_difference_subschema() {
+        let expected = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, true),
+        ]);
+        let expected = Schema::try_from(&expected).unwrap();
+
+        // Can omit nullable fields and subfields
+        let subschema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+        ]);
+        let subschema = Schema::try_from(&subschema).unwrap();
+
+        assert!(!subschema.compare_with_options(&expected, &SchemaCompareOptions::default()));
+        assert_eq!(
+            subschema.explain_difference(&expected, &SchemaCompareOptions::default()),
+            Some(
+                "fields did not match, missing=[c], unexpected=[], `b` had mismatched \
+                 children: fields did not match, missing=[b.f1], unexpected=[]"
+                    .to_string()
+            )
+        );
+        let options = SchemaCompareOptions {
+            allow_missing_if_nullable: true,
+            ..Default::default()
+        };
+        assert!(subschema.compare_with_options(&expected, &options));
+        let res = subschema.explain_difference(&expected, &options);
+        assert!(res.is_none(), "Expected None, got {:?}", res);
+
+        // Omitting non-nullable fields should fail
+        let subschema = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "f2",
+                DataType::Boolean,
+                false,
+            )])),
+            true,
+        )]);
+        let subschema = Schema::try_from(&subschema).unwrap();
+        assert!(!subschema.compare_with_options(&expected, &options));
+        assert_eq!(
+            subschema.explain_difference(&expected, &options),
+            Some(
+                "fields did not match, missing=[a], unexpected=[], `b` had mismatched \
+                 children: fields did not match, missing=[b.f3], unexpected=[]"
+                    .to_string()
+            )
+        );
+
+        let out_of_order = ArrowSchema::new(vec![
+            ArrowField::new("c", DataType::Float64, true),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f3", DataType::Float32, false),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f1", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("a", DataType::Int32, false),
+        ]);
+        let out_of_order = Schema::try_from(&out_of_order).unwrap();
+        assert!(!out_of_order.compare_with_options(&expected, &options));
+        assert_eq!(
+            subschema.explain_difference(&expected, &options),
+            Some(
+                "fields did not match, missing=[a], unexpected=[], `b` had mismatched \
+                 children: fields did not match, missing=[b.f3], unexpected=[]"
+                    .to_string()
+            )
+        );
+
+        let options = SchemaCompareOptions {
+            ignore_field_order: true,
+            ..Default::default()
+        };
+        assert!(out_of_order.compare_with_options(&expected, &options));
+        let res = out_of_order.explain_difference(&expected, &options);
+        assert!(res.is_none(), "Expected None, got {:?}", res);
+    }
+
+    #[test]
+    pub fn test_all_fields_nullable() {
+        let test_cases = vec![
+            (
+                vec![], // empty schema
+                true,
+            ),
+            (
+                vec![
+                    Field::new_arrow("a", DataType::Int32, true).unwrap(),
+                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
+                ], // basic case
+                true,
+            ),
+            (
+                vec![
+                    Field::new_arrow("a", DataType::Int32, false).unwrap(),
+                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
+                ],
+                false,
+            ),
+            (
+                // check nested schema, parent is nullable
+                vec![Field::new_arrow(
+                    "struct",
+                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                        "a",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    true,
+                )
+                .unwrap()],
+                false,
+            ),
+            (
+                // check nested schema, child is nullable
+                vec![Field::new_arrow(
+                    "struct",
+                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                        "a",
+                        DataType::Int32,
+                        true,
+                    )])),
+                    false,
+                )
+                .unwrap()],
+                false,
+            ),
+            (
+                // check nested schema, all is nullable
+                vec![Field::new_arrow(
+                    "struct",
+                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                        "a",
+                        DataType::Int32,
+                        true,
+                    )])),
+                    true,
+                )
+                .unwrap()],
+                true,
+            ),
+        ];
+
+        for (fields, expected) in test_cases {
+            let schema = Schema {
+                fields,
+                metadata: Default::default(),
+            };
+            assert_eq!(schema.all_fields_nullable(), expected);
+        }
     }
 }

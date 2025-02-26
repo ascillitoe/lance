@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use arrow::compute::concat;
+use arrow::datatypes::Float32Type;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
@@ -26,13 +27,14 @@ use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
 use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_linalg::kmeans::compute_partitions;
+use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_linalg::{
     distance::DistanceType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
 };
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
+use pyo3::intern;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
@@ -58,19 +60,46 @@ pub struct KMeans {
 #[pymethods]
 impl KMeans {
     #[new]
-    #[pyo3(signature = (k, metric_type="l2", max_iters=50))]
-    fn new(k: usize, metric_type: &str, max_iters: u32) -> PyResult<Self> {
+    #[pyo3(signature = (k, metric_type="l2", max_iters=50, centroids_arr=None))]
+    fn new(
+        k: usize,
+        metric_type: &str,
+        max_iters: u32,
+        centroids_arr: Option<&Bound<PyAny>>,
+    ) -> PyResult<Self> {
+        let trained_kmeans = if let Some(arr) = centroids_arr {
+            let data = ArrayData::from_pyarrow_bound(arr)?;
+            if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
+                return Err(PyValueError::new_err("Must be a FixedSizeList"));
+            }
+            let fixed_size_arr = FixedSizeListArray::from(data);
+            let params = KMeansParams {
+                distance_type: metric_type.try_into().unwrap(),
+                max_iters,
+                ..Default::default()
+            };
+            let kmeans =
+                LanceKMeans::new_with_params(&fixed_size_arr, k, &params).map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "Error initialing KMeans from existing centroids: {}",
+                        e
+                    ))
+                })?;
+            Some(kmeans)
+        } else {
+            None
+        };
         Ok(Self {
             k,
             metric_type: metric_type.try_into().unwrap(),
             max_iters,
-            trained_kmeans: None,
+            trained_kmeans,
         })
     }
 
     /// Train the model
-    fn fit(&mut self, _py: Python, arr: &PyAny) -> PyResult<()> {
-        let data = ArrayData::from_pyarrow(arr)?;
+    fn fit(&mut self, _py: Python, arr: &Bound<PyAny>) -> PyResult<()> {
+        let data = ArrayData::from_pyarrow_bound(arr)?;
         if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
         }
@@ -86,11 +115,11 @@ impl KMeans {
         Ok(())
     }
 
-    fn predict(&self, py: Python, array: &PyAny) -> PyResult<PyObject> {
+    fn predict(&self, py: Python, array: &Bound<PyAny>) -> PyResult<PyObject> {
         let Some(kmeans) = self.trained_kmeans.as_ref() else {
             return Err(PyRuntimeError::new_err("KMeans must fit (train) first"));
         };
-        let data = ArrayData::from_pyarrow(array)?;
+        let data = ArrayData::from_pyarrow_bound(array)?;
         if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
         }
@@ -105,14 +134,15 @@ impl KMeans {
         if !matches!(fixed_size_arr.value_type(), DataType::Float32) {
             return Err(PyValueError::new_err("Must be a FixedSizeList of Float32"));
         };
-        let values: Arc<Float32Array> = fixed_size_arr.values().as_primitive().clone().into();
-        let centroids: &Float32Array = kmeans.centroids.as_primitive();
-        let cluster_ids = UInt32Array::from(compute_partitions(
-            centroids.values(),
-            values.values(),
-            kmeans.dimension,
-            kmeans.distance_type,
-        ));
+        let values = fixed_size_arr.values().as_primitive();
+        let centroids = kmeans.centroids.as_primitive();
+        let cluster_ids =
+            UInt32Array::from(compute_partitions::<
+                Float32Type,
+                KMeansAlgoFloat<Float32Type>,
+            >(
+                centroids, values, kmeans.dimension, kmeans.distance_type
+            ));
         cluster_ids.into_data().to_pyarrow(py)
     }
 
@@ -151,7 +181,7 @@ impl Hnsw {
         distance_type="l2",
     ))]
     fn build(
-        vectors_array: &PyIterator,
+        vectors_array: &Bound<PyIterator>,
         max_level: u16,
         m: usize,
         ef_construction: usize,
@@ -164,7 +194,7 @@ impl Hnsw {
 
         let mut data: Vec<Arc<dyn Array>> = Vec::new();
         for vectors in vectors_array {
-            let vectors = ArrayData::from_pyarrow(vectors?)?;
+            let vectors = ArrayData::from_pyarrow_bound(&vectors?)?;
             if !matches!(vectors.data_type(), DataType::FixedSizeList(_, _)) {
                 return Err(PyValueError::new_err("Must be a FixedSizeList"));
             }
@@ -213,5 +243,49 @@ impl Hnsw {
 
     fn vectors(&self, py: Python) -> PyResult<PyObject> {
         self.vectors.to_data().to_pyarrow(py)
+    }
+}
+
+/// A newtype wrapper for a Lance type.
+///
+/// This is used for types that have a corresponding dataclass in Python.
+pub struct PyLance<T>(pub T);
+
+impl<T> IntoPy<PyObject> for PyLance<T>
+where
+    Self: ToPyObject,
+{
+    fn into_py(self, py: Python) -> PyObject {
+        self.to_object(py)
+    }
+}
+
+/// Extract a Vec of PyLance types from a Python object.
+pub fn extract_vec<'a, T>(ob: &Bound<'a, PyAny>) -> PyResult<Vec<T>>
+where
+    PyLance<T>: FromPyObject<'a>,
+{
+    ob.extract::<Vec<PyLance<T>>>()
+        .map(|v| v.into_iter().map(|t| t.0).collect())
+}
+
+/// Export a Vec of Lance types to a Python object.
+pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> Vec<PyObject>
+where
+    PyLance<&'a T>: ToPyObject,
+{
+    vec.iter()
+        .map(|t| PyLance(t).to_object(py))
+        .collect::<Vec<_>>()
+}
+
+pub fn class_name<'a>(ob: &'a Bound<'_, PyAny>) -> PyResult<&'a str> {
+    let full_name: &str = ob
+        .getattr(intern!(ob.py(), "__class__"))?
+        .getattr(intern!(ob.py(), "__name__"))?
+        .extract()?;
+    match full_name.rsplit_once('.') {
+        Some((_, name)) => Ok(name),
+        None => Ok(full_name),
     }
 }

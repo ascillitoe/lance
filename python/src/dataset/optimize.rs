@@ -23,7 +23,7 @@ use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple
 
 use super::*;
 
-fn parse_compaction_options(options: &PyDict) -> PyResult<CompactionOptions> {
+fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionOptions> {
     let mut opts = CompactionOptions::default();
 
     for (key, value) in options.into_iter() {
@@ -36,6 +36,9 @@ fn parse_compaction_options(options: &PyDict) -> PyResult<CompactionOptions> {
             "max_rows_per_group" => {
                 opts.max_rows_per_group = value.extract()?;
             }
+            "max_bytes_per_file" => {
+                opts.max_bytes_per_file = value.extract()?;
+            }
             "materialize_deletions" => {
                 opts.materialize_deletions = value.extract()?;
             }
@@ -43,9 +46,10 @@ fn parse_compaction_options(options: &PyDict) -> PyResult<CompactionOptions> {
                 opts.materialize_deletions_threshold = value.extract()?;
             }
             "num_threads" => {
-                opts.num_threads = value
-                    .extract::<Option<usize>>()?
-                    .unwrap_or_else(num_cpus::get);
+                opts.num_threads = value.extract()?;
+            }
+            "batch_size" => {
+                opts.batch_size = value.extract()?;
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -64,7 +68,8 @@ fn unwrap_dataset(dataset: PyObject) -> PyResult<Py<Dataset>> {
 }
 
 fn wrap_fragment(py: Python<'_>, fragment: &Fragment) -> PyResult<PyObject> {
-    let fragment_metadata = PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
+    let fragment_metadata =
+        PyModule::import_bound(py, "lance.fragment")?.getattr("FragmentMetadata")?;
     let fragment_json = serde_json::to_string(&fragment).map_err(|x| {
         PyValueError::new_err(format!("failed to serialize fragment metadata: {}", x))
     })?;
@@ -186,8 +191,8 @@ impl PyCompactionPlan {
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new(py, vec![state]).extract()?;
-        let from_json = PyModule::import(py, "lance.optimize")?
+        let state = PyTuple::new_bound(py, vec![state]).extract()?;
+        let from_json = PyModule::import_bound(py, "lance.optimize")?
             .getattr("CompactionPlan")?
             .getattr("from_json")?
             .extract()?;
@@ -298,8 +303,8 @@ impl PyCompactionTask {
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new(py, vec![state]).extract()?;
-        let from_json = PyModule::import(py, "lance.optimize")?
+        let state = PyTuple::new_bound(py, vec![state]).extract()?;
+        let from_json = PyModule::import_bound(py, "lance.optimize")?
             .getattr("CompactionTask")?
             .getattr("from_json")?
             .extract()?;
@@ -413,8 +418,8 @@ impl PyRewriteResult {
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new(py, vec![state]).extract()?;
-        let from_json = PyModule::import(py, "lance.optimize")?
+        let state = PyTuple::new_bound(py, vec![state]).extract()?;
+        let from_json = PyModule::import_bound(py, "lance.optimize")?
             .getattr("RewriteResult")?
             .getattr("from_json")?
             .extract()?;
@@ -468,7 +473,7 @@ impl PyCompaction {
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
         let opts = Python::with_gil(|py| {
-            let options = options.downcast::<PyDict>(py)?;
+            let options = options.downcast_bound::<PyDict>(py)?;
             parse_compaction_options(options)
         })?;
         let mut new_ds = dataset.ds.as_ref().clone();
@@ -505,7 +510,7 @@ impl PyCompaction {
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
         let opts = Python::with_gil(|py| {
-            let options = options.downcast::<PyDict>(py)?;
+            let options = options.downcast_bound::<PyDict>(py)?;
             parse_compaction_options(options)
         })?;
         let plan = RT

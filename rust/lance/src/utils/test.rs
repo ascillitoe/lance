@@ -11,16 +11,17 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
-use lance_io::object_store::WrappingObjectStore;
+use lance_datagen::{BatchCount, BatchGeneratorBuilder, RowCount};
+use lance_file::version::LanceFileVersion;
+use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore};
 use lance_table::format::Fragment;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore, PutOptions, PutResult,
-    Result as OSResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
-use tokio::io::AsyncWrite;
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
@@ -35,19 +36,19 @@ use crate::Dataset;
 pub struct TestDatasetGenerator {
     seed: Option<u64>,
     data: Vec<RecordBatch>,
-    use_legacy_format: bool,
+    data_storage_version: LanceFileVersion,
 }
 
 impl TestDatasetGenerator {
     /// Create a new dataset generator with the given data.
     ///
     /// Each batch will become a separate fragment in the dataset.
-    pub fn new(data: Vec<RecordBatch>, use_legacy_format: bool) -> Self {
+    pub fn new(data: Vec<RecordBatch>, data_storage_version: LanceFileVersion) -> Self {
         assert!(!data.is_empty());
         Self {
             data,
             seed: None,
-            use_legacy_format,
+            data_storage_version,
         }
     }
 
@@ -110,11 +111,24 @@ impl TestDatasetGenerator {
             }
         }
 
-        let operation = Operation::Overwrite { fragments, schema };
+        let operation = Operation::Overwrite {
+            fragments,
+            schema,
+            config_upsert_values: None,
+        };
 
-        Dataset::commit(uri, operation, None, Default::default(), None)
-            .await
-            .unwrap()
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        Dataset::commit(
+            uri,
+            operation,
+            None,
+            Default::default(),
+            None,
+            registry,
+            false,
+        )
+        .await
+        .unwrap()
     }
 
     fn make_schema(&self, rng: &mut impl Rng) -> Schema {
@@ -195,7 +209,7 @@ impl TestDatasetGenerator {
             let sub_frag = FragmentCreateBuilder::new(uri)
                 .schema(&file_schema)
                 .write_params(&WriteParams {
-                    use_legacy_format: self.use_legacy_format,
+                    data_storage_version: Some(self.data_storage_version),
                     ..Default::default()
                 })
                 .write(reader, None)
@@ -257,6 +271,8 @@ fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
 pub struct IoStats {
     pub read_iops: u64,
     pub read_bytes: u64,
+    pub write_iops: u64,
+    pub write_bytes: u64,
 }
 
 impl Display for IoStats {
@@ -300,32 +316,36 @@ impl IoTrackingStore {
         stats.read_iops += 1;
         stats.read_bytes += num_bytes;
     }
+
+    fn record_write(&self, num_bytes: u64) {
+        let mut stats = self.stats.lock().unwrap();
+        stats.write_iops += 1;
+        stats.write_bytes += num_bytes;
+    }
 }
 
 #[async_trait::async_trait]
 impl ObjectStore for IoTrackingStore {
-    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
-        self.target.put(location, bytes).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
-        bytes: Bytes,
+        bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
+        self.record_write(bytes.content_length() as u64);
         self.target.put_opts(location, bytes, opts).await
     }
 
-    async fn put_multipart(
+    async fn put_multipart_opts(
         &self,
         location: &Path,
-    ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
-        self.target.put_multipart(location).await
-    }
-
-    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
-        self.target.abort_multipart(location, multipart_id).await
+        opts: PutMultipartOpts,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        let target = self.target.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(IoTrackingMultipartUpload {
+            target,
+            stats: self.stats.clone(),
+        }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -380,15 +400,94 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.record_write(0);
         self.target.copy(from, to).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.record_write(0);
         self.target.rename(from, to).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.record_write(0);
         self.target.copy_if_not_exists(from, to).await
+    }
+}
+
+#[derive(Debug)]
+struct IoTrackingMultipartUpload {
+    target: Box<dyn MultipartUpload>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for IoTrackingMultipartUpload {
+    async fn abort(&mut self) -> OSResult<()> {
+        self.target.abort().await
+    }
+
+    async fn complete(&mut self) -> OSResult<PutResult> {
+        self.target.complete().await
+    }
+
+    fn put_part(&mut self, payload: PutPayload) -> UploadPart {
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.write_iops += 1;
+            stats.write_bytes += payload.content_length() as u64;
+        }
+        self.target.put_part(payload)
+    }
+}
+
+pub struct FragmentCount(pub u32);
+
+impl From<u32> for FragmentCount {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+pub struct FragmentRowCount(pub u32);
+
+impl From<u32> for FragmentRowCount {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+#[async_trait::async_trait]
+pub trait DatagenExt {
+    async fn into_dataset(
+        self,
+        path: &str,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset>;
+}
+
+#[async_trait::async_trait]
+impl DatagenExt for BatchGeneratorBuilder {
+    async fn into_dataset(
+        self,
+        path: &str,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset> {
+        let reader = self.into_reader_rows(
+            RowCount::from(rows_per_fragment.0 as u64),
+            BatchCount::from(frag_count.0),
+        );
+        Dataset::write(
+            reader,
+            path,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment.0 as usize,
+                ..Default::default()
+            }),
+        )
+        .await
     }
 }
 
@@ -403,7 +502,10 @@ mod tests {
 
     #[rstest]
     #[test]
-    fn test_make_schema(#[values(false, true)] use_legacy_format: bool) {
+    fn test_make_schema(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new(
@@ -421,7 +523,7 @@ mod tests {
         ]));
         let data = vec![RecordBatch::new_empty(arrow_schema.clone())];
 
-        let generator = TestDatasetGenerator::new(data, use_legacy_format);
+        let generator = TestDatasetGenerator::new(data, data_storage_version);
         let schema = generator.make_schema(&mut rand::thread_rng());
 
         let roundtripped_schema = ArrowSchema::from(&schema);
@@ -445,7 +547,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_make_fragment(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_make_fragment(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let struct_fields: ArrowFields = vec![
@@ -475,7 +580,7 @@ mod tests {
         )
         .unwrap();
 
-        let generator = TestDatasetGenerator::new(vec![data.clone()], use_legacy_format);
+        let generator = TestDatasetGenerator::new(vec![data.clone()], data_storage_version);
         let mut rng = rand::thread_rng();
         for _ in 1..50 {
             let schema = generator.make_schema(&mut rng);
@@ -507,7 +612,10 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_make_hostile(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_make_hostile(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -537,7 +645,7 @@ mod tests {
         ];
 
         let seed = 42;
-        let generator = TestDatasetGenerator::new(data.clone(), use_legacy_format).seed(seed);
+        let generator = TestDatasetGenerator::new(data.clone(), data_storage_version).seed(seed);
 
         let path = tmp_dir.path().join("ds1");
         let dataset = generator.make_hostile(path.to_str().unwrap()).await;
@@ -559,7 +667,7 @@ mod tests {
                 .map(|rb| rb.project(&projection).unwrap())
                 .collect::<Vec<RecordBatch>>();
 
-            let generator = TestDatasetGenerator::new(data.clone(), use_legacy_format);
+            let generator = TestDatasetGenerator::new(data.clone(), data_storage_version);
             // Sample a few
             for i in 1..20 {
                 let path = tmp_dir.path().join(format!("test_ds_{}_{}", num_cols, i));

@@ -4,9 +4,10 @@
 //! Lance Schema Field
 
 use std::{
-    cmp::max,
-    collections::{HashMap, HashSet},
-    fmt,
+    cmp::{max, Ordering},
+    collections::{HashMap, VecDeque},
+    fmt::{self, Display},
+    str::FromStr,
     sync::Arc,
 };
 
@@ -20,10 +21,26 @@ use arrow_array::{
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
-use snafu::{location, Location};
+use snafu::location;
 
-use super::{Dictionary, LogicalType};
+use super::{
+    schema::{compare_fields, explain_fields_difference},
+    Dictionary, LogicalType, Projection,
+};
 use crate::{Error, Result};
+
+pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
+
+#[derive(Debug, Default)]
+pub enum NullabilityComparison {
+    // If the nullabilities don't match then the fields don't match
+    #[default]
+    Strict,
+    // If the expected schema is nullable then a non-nullable version of the field is allowed
+    OneWay,
+    // Nullability is ignored when comparing fields
+    Ignore,
+}
 
 #[derive(Default)]
 pub struct SchemaCompareOptions {
@@ -33,6 +50,16 @@ pub struct SchemaCompareOptions {
     pub compare_dictionary: bool,
     /// Should the field ids be compared (default false)
     pub compare_field_ids: bool,
+    /// Should nullability be compared (default Strict)
+    pub compare_nullability: NullabilityComparison,
+    /// Allow fields in the expected schema to be missing from the schema being tested if  
+    /// they are nullable (default false)  
+    ///  
+    /// Fields in the schema being tested must always be present in the expected schema  
+    /// regardless of this flag.  
+    pub allow_missing_if_nullable: bool,
+    /// Allow out of order fields (default false)
+    pub ignore_field_order: bool,
 }
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
@@ -45,6 +72,47 @@ pub enum Encoding {
     Dictionary,
     /// RLE encoding.
     RLE,
+}
+
+/// Describes the rate at which a column should be compacted
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+pub enum StorageClass {
+    /// Default storage class (stored in primary dataset)
+    #[default]
+    Default,
+    /// Blob storage class (stored in blob dataset)
+    Blob,
+}
+
+impl Display for StorageClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => write!(f, "default"),
+            Self::Blob => write!(f, "blob"),
+        }
+    }
+}
+
+impl FromStr for StorageClass {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "default" | "" => Ok(Self::Default),
+            "blob" => Ok(Self::Blob),
+            _ => Err(Error::Schema {
+                message: format!("Unknown storage class: {}", s),
+                location: location!(),
+            }),
+        }
+    }
+}
+
+/// What to do on a merge operation if the types of the fields don't match
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+pub enum OnTypeMismatch {
+    TakeSelf,
+    Error,
 }
 
 /// Lance Schema Field
@@ -64,9 +132,16 @@ pub struct Field {
 
     /// Dictionary value array if this field is dictionary.
     pub dictionary: Option<Dictionary>,
+    pub storage_class: StorageClass,
 }
 
 impl Field {
+    /// Shortcut for creating a field with no field id (i.e. from the same info
+    /// needed to create an Arrow field)
+    pub fn new_arrow(name: &str, data_type: DataType, nullable: bool) -> Result<Self> {
+        Self::try_from(ArrowField::new(name, data_type, nullable))
+    }
+
     /// Returns arrow data type.
     pub fn data_type(&self) -> DataType {
         match &self.logical_type {
@@ -86,7 +161,115 @@ impl Field {
             || self.children.iter().any(Self::has_dictionary_types)
     }
 
-    fn explain_differences(
+    pub fn is_default_storage(&self) -> bool {
+        self.storage_class == StorageClass::Default
+    }
+
+    pub fn storage_class(&self) -> StorageClass {
+        self.storage_class
+    }
+
+    /// Merge a field with another field using a reference field to ensure
+    /// the correct order of fields
+    ///
+    /// For each child in the reference field we look for a matching child
+    /// in self and other.
+    ///
+    /// If we find a match in both we recursively merge the children.
+    /// If we find a match in one but not the other we take the matching child.
+    ///
+    /// Primitive fields we simply clone self and return.
+    ///
+    /// Matches are determined using field names and so ids are not required.
+    pub fn merge_with_reference(&self, other: &Self, reference: &Self) -> Self {
+        let mut new_children = Vec::with_capacity(reference.children.len());
+        let mut self_children_itr = self.children.iter().peekable();
+        let mut other_children_itr = other.children.iter().peekable();
+        for ref_child in &reference.children {
+            match (self_children_itr.peek(), other_children_itr.peek()) {
+                (Some(&only_child), None) => {
+                    // other is exhausted so just check if self matches
+                    if only_child.name == ref_child.name {
+                        new_children.push(only_child.clone());
+                        self_children_itr.next();
+                    }
+                }
+                (None, Some(&only_child)) => {
+                    // Self is exhausted so just check if other matches
+                    if only_child.name == ref_child.name {
+                        new_children.push(only_child.clone());
+                        other_children_itr.next();
+                    }
+                }
+                (Some(&self_child), Some(&other_child)) => {
+                    // Both iterators have potential, see if any match
+                    match (
+                        ref_child.name.cmp(&self_child.name),
+                        ref_child.name.cmp(&other_child.name),
+                    ) {
+                        (Ordering::Equal, Ordering::Equal) => {
+                            // Both match, recursively merge
+                            new_children
+                                .push(self_child.merge_with_reference(other_child, ref_child));
+                            self_children_itr.next();
+                            other_children_itr.next();
+                        }
+                        (Ordering::Equal, _) => {
+                            // Self matches, other doesn't, use self as-is
+                            new_children.push(self_child.clone());
+                            self_children_itr.next();
+                        }
+                        (_, Ordering::Equal) => {
+                            // Other matches, self doesn't, use other as-is
+                            new_children.push(other_child.clone());
+                            other_children_itr.next();
+                        }
+                        _ => {
+                            // Neither match, field is projected out
+                        }
+                    }
+                }
+                (None, None) => {
+                    // Both iterators are exhausted, we can quit, all remaining fields projected out
+                    break;
+                }
+            }
+        }
+        Self {
+            children: new_children,
+            ..self.clone()
+        }
+    }
+
+    pub fn apply_projection(&self, projection: &Projection) -> Option<Self> {
+        let children = self
+            .children
+            .iter()
+            .filter_map(|c| c.apply_projection(projection))
+            .collect::<Vec<_>>();
+
+        // The following case is invalid:
+        // - This is a nested field (has children)
+        // - All children were projected away
+        // - Caller is asking for the parent field
+        assert!(
+            // One of the following must be true
+            !children.is_empty() // Some children were projected
+                || !projection.contains_field_id(self.id) // Caller is not asking for this field
+                || self.children.is_empty() // This isn't a nested field
+        );
+
+        if children.is_empty() && !projection.contains_field_id(self.id) {
+            None
+        } else {
+            Some(Self {
+                children,
+                ..self.clone()
+            })
+        }
+    }
+
+    pub(crate) fn explain_differences(
         &self,
         expected: &Self,
         options: &SchemaCompareOptions,
@@ -127,7 +310,7 @@ impl Field {
                 self_name, expected.logical_type, self.logical_type
             ));
         }
-        if self.nullable != expected.nullable {
+        if !Self::compare_nullability(expected.nullable, self.nullable, options) {
             differences.push(format!(
                 "`{}` should have nullable={} but nullable={}",
                 self_name, expected.nullable, self.nullable
@@ -145,61 +328,19 @@ impl Field {
                 self_name
             ));
         }
-        if self.children.len() != expected.children.len()
-            || !self
-                .children
-                .iter()
-                .zip(expected.children.iter())
-                .all(|(child, expected)| child.name == expected.name)
-        {
-            let self_children = self
-                .children
-                .iter()
-                .map(|child| child.name.clone())
-                .collect::<HashSet<_>>();
-            let expected_children = expected
-                .children
-                .iter()
-                .map(|child| child.name.clone())
-                .collect::<HashSet<_>>();
-            let missing = expected_children
-                .difference(&self_children)
-                .cloned()
-                .collect::<Vec<_>>();
-            let unexpected = self_children
-                .difference(&expected_children)
-                .cloned()
-                .collect::<Vec<_>>();
-            if missing.is_empty() && unexpected.is_empty() {
-                differences.push(format!(
-                    "`{}` field order mismatch, expected [{}] but was [{}]",
-                    self_name,
-                    expected
-                        .children
-                        .iter()
-                        .map(|child| child.name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    self.children
-                        .iter()
-                        .map(|child| child.name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ));
-            } else {
-                differences.push(format!(
-                    "`{}` had mismatched children, missing=[{}] unexpected=[{}]",
-                    self_name,
-                    missing.join(", "),
-                    unexpected.join(", ")
-                ));
-            }
-        } else {
-            differences.extend(self.children.iter().zip(expected.children.iter()).flat_map(
-                |(child, expected_child)| {
-                    child.explain_differences(expected_child, options, Some(&self_name))
-                },
-            ));
+        let children_differences = explain_fields_difference(
+            &self.children,
+            &expected.children,
+            options,
+            Some(&self_name),
+        );
+        if !children_differences.is_empty() {
+            let children_differences = format!(
+                "`{}` had mismatched children: {}",
+                self_name,
+                children_differences.join(", ")
+            );
+            differences.push(children_differences);
         }
         differences
     }
@@ -217,23 +358,26 @@ impl Field {
         }
     }
 
-    pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
-        if self.children.len() != expected.children.len() {
-            false
-        } else {
-            self.name == expected.name
-                && self.logical_type == expected.logical_type
-                && self.nullable == expected.nullable
-                && self.children.len() == expected.children.len()
-                && self
-                    .children
-                    .iter()
-                    .zip(&expected.children)
-                    .all(|(left, right)| left.compare_with_options(right, options))
-                && (!options.compare_field_ids || self.id == expected.id)
-                && (!options.compare_dictionary || self.dictionary == expected.dictionary)
-                && (!options.compare_metadata || self.metadata == expected.metadata)
+    pub fn compare_nullability(
+        expected_nullability: bool,
+        actual_nullability: bool,
+        options: &SchemaCompareOptions,
+    ) -> bool {
+        match options.compare_nullability {
+            NullabilityComparison::Strict => expected_nullability == actual_nullability,
+            NullabilityComparison::OneWay => expected_nullability || !actual_nullability,
+            NullabilityComparison::Ignore => true,
         }
+    }
+
+    pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
+        self.name == expected.name
+            && self.logical_type == expected.logical_type
+            && Self::compare_nullability(expected.nullable, self.nullable, options)
+            && compare_fields(&self.children, &expected.children, options)
+            && (!options.compare_field_ids || self.id == expected.id)
+            && (!options.compare_dictionary || self.dictionary == expected.dictionary)
+            && (!options.compare_metadata || self.metadata == expected.metadata)
     }
 
     pub fn extension_name(&self) -> Option<&str> {
@@ -340,6 +484,7 @@ impl Field {
             nullable: self.nullable,
             children: vec![],
             dictionary: self.dictionary.clone(),
+            storage_class: self.storage_class,
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -398,13 +543,13 @@ impl Field {
     ///
     /// If the ids are `[2]`, then this will include the parent `0` and the
     /// child `3`.
-    pub(crate) fn project_by_ids(&self, ids: &[i32]) -> Option<Self> {
+    pub(crate) fn project_by_ids(&self, ids: &[i32], include_all_children: bool) -> Option<Self> {
         let children = self
             .children
             .iter()
-            .filter_map(|c| c.project_by_ids(ids))
+            .filter_map(|c| c.project_by_ids(ids, include_all_children))
             .collect::<Vec<_>>();
-        if ids.contains(&self.id) {
+        if ids.contains(&self.id) && (children.is_empty() || include_all_children) {
             Some(self.clone())
         } else if !children.is_empty() {
             Some(Self {
@@ -418,7 +563,7 @@ impl Field {
 
     /// Project by a field.
     ///
-    pub fn project_by_field(&self, other: &Self) -> Result<Self> {
+    pub fn project_by_field(&self, other: &Self, on_type_mismatch: OnTypeMismatch) -> Result<Self> {
         if self.name != other.name {
             return Err(Error::Schema {
                 message: format!(
@@ -458,7 +603,7 @@ impl Field {
                             location: location!(),
                         });
                     };
-                    fields.push(child.project_by_field(other_field)?);
+                    fields.push(child.project_by_field(other_field, on_type_mismatch)?);
                 }
                 let mut cloned = self.clone();
                 cloned.children = fields;
@@ -466,7 +611,8 @@ impl Field {
             }
             (DataType::List(_), DataType::List(_))
             | (DataType::LargeList(_), DataType::LargeList(_)) => {
-                let projected = self.children[0].project_by_field(&other.children[0])?;
+                let projected =
+                    self.children[0].project_by_field(&other.children[0], on_type_mismatch)?;
                 let mut cloned = self.clone();
                 cloned.children = vec![projected];
                 Ok(cloned)
@@ -486,19 +632,37 @@ impl Field {
             {
                 Ok(self.clone())
             }
-            _ => Err(Error::Schema {
-                message: format!(
-                    "Attempt to project incompatible fields: {} and {}",
-                    self, other
-                ),
-                location: location!(),
-            }),
+            _ => match on_type_mismatch {
+                OnTypeMismatch::Error => Err(Error::Schema {
+                    message: format!(
+                        "Attempt to project incompatible fields: {} and {}",
+                        self, other
+                    ),
+                    location: location!(),
+                }),
+                OnTypeMismatch::TakeSelf => Ok(self.clone()),
+            },
         }
     }
 
-    /// Intersection of two [`Field`]s.
-    ///
-    pub fn intersection(&self, other: &Self) -> Result<Self> {
+    pub(crate) fn resolve<'a>(
+        &'a self,
+        split: &mut VecDeque<&str>,
+        fields: &mut Vec<&'a Self>,
+    ) -> bool {
+        fields.push(self);
+        if split.is_empty() {
+            return true;
+        }
+        let first = split.pop_front().unwrap();
+        if let Some(child) = self.children.iter().find(|c| c.name == first) {
+            child.resolve(split, fields)
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         if self.name != other.name {
             return Err(Error::Arrow {
                 message: format!(
@@ -525,7 +689,7 @@ impl Field {
                 .collect::<Vec<_>>();
             let f = Self {
                 name: self.name.clone(),
-                id: self.id,
+                id: if self.id >= 0 { self.id } else { other.id },
                 parent_id: self.parent_id,
                 logical_type: self.logical_type.clone(),
                 metadata: self.metadata.clone(),
@@ -533,11 +697,12 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
+                storage_class: self.storage_class,
             };
             return Ok(f);
         }
 
-        if self_type != other_type || self.name != other.name {
+        if (!ignore_types && self_type != other_type) || self.name != other.name {
             return Err(Error::Arrow {
                 message: format!(
                     "Attempt to intersect different fields: ({}, {}) and ({}, {})",
@@ -547,7 +712,22 @@ impl Field {
             });
         }
 
-        Ok(self.clone())
+        Ok(if self.id >= 0 {
+            self.clone()
+        } else {
+            other.clone()
+        })
+    }
+
+    /// Intersection of two [`Field`]s.
+    ///
+    pub fn intersection(&self, other: &Self) -> Result<Self> {
+        self.do_intersection(other, false)
+    }
+
+    /// Intersection of two [`Field`]s, ignoring data types.
+    pub fn intersection_ignore_types(&self, other: &Self) -> Result<Self> {
+        self.do_intersection(other, true)
     }
 
     pub fn exclude(&self, other: &Self) -> Option<Self> {
@@ -580,6 +760,7 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
+                storage_class: self.storage_class,
             })
         }
     }
@@ -652,6 +833,19 @@ impl Field {
         self.children.iter_mut().for_each(Self::reset_id);
     }
 
+    pub fn field_by_id_mut(&mut self, id: impl Into<i32>) -> Option<&mut Self> {
+        let id = id.into();
+        for child in self.children.as_mut_slice() {
+            if child.id == id {
+                return Some(child);
+            }
+            if let Some(grandchild) = child.field_by_id_mut(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
+
     pub fn field_by_id(&self, id: impl Into<i32>) -> Option<&Self> {
         let id = id.into();
         for child in self.children.as_slice() {
@@ -677,6 +871,15 @@ impl Field {
             }
         }
         None
+    }
+
+    // Check if field has metadata `packed` set to true, this check is case insensitive.
+    pub fn is_packed_struct(&self) -> bool {
+        let field_metadata = &self.metadata;
+        field_metadata
+            .get("packed")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false)
     }
 }
 
@@ -717,6 +920,12 @@ impl TryFrom<&ArrowField> for Field {
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
+        let storage_class = field
+            .metadata()
+            .get(LANCE_STORAGE_CLASS_SCHEMA_META_KEY)
+            .map(|s| StorageClass::from_str(s))
+            .unwrap_or(Ok(StorageClass::Default))?;
+
         Ok(Self {
             id: -1,
             parent_id: -1,
@@ -734,6 +943,7 @@ impl TryFrom<&ArrowField> for Field {
             nullable: field.is_nullable(),
             children,
             dictionary: None,
+            storage_class,
         })
     }
 }
@@ -749,6 +959,16 @@ impl TryFrom<ArrowField> for Field {
 impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
+        let mut metadata = field.metadata.clone();
+        match field.storage_class {
+            StorageClass::Default => {}
+            StorageClass::Blob => {
+                metadata.insert(
+                    LANCE_STORAGE_CLASS_SCHEMA_META_KEY.to_string(),
+                    "blob".to_string(),
+                );
+            }
+        }
         out.with_metadata(field.metadata.clone())
     }
 }
@@ -878,19 +1098,19 @@ mod tests {
         let f2: Field = ArrowField::new("a", DataType::Null, true)
             .try_into()
             .unwrap();
-        let p1 = f1.project_by_field(&f2).unwrap();
+        let p1 = f1.project_by_field(&f2, OnTypeMismatch::Error).unwrap();
 
         assert_eq!(p1, f1);
 
         let f3: Field = ArrowField::new("b", DataType::Null, true)
             .try_into()
             .unwrap();
-        assert!(f1.project_by_field(&f3).is_err());
+        assert!(f1.project_by_field(&f3, OnTypeMismatch::Error).is_err());
 
         let f4: Field = ArrowField::new("a", DataType::Int32, true)
             .try_into()
             .unwrap();
-        assert!(f1.project_by_field(&f4).is_err());
+        assert!(f1.project_by_field(&f4, OnTypeMismatch::Error).is_err());
     }
 
     #[test]
@@ -1067,7 +1287,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             wrong_child.explain_difference(&expected, &opts),
-            Some("`a.b` should have nullable=true but nullable=false".to_string())
+            Some(
+                "`a` had mismatched children: `a.b` should have nullable=true but nullable=false"
+                    .to_string()
+            )
         );
 
         let mismatched_children: Field = ArrowField::new(
@@ -1082,13 +1305,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             mismatched_children.explain_difference(&expected, &opts),
-            Some("`a` had mismatched children, missing=[c] unexpected=[d]".to_string())
+            Some("`a` had mismatched children: fields did not match, missing=[a.c], unexpected=[a.d]".to_string())
         );
 
         let reordered_children: Field = ArrowField::new(
             "a",
             DataType::Struct(Fields::from(vec![
-                ArrowField::new("c", DataType::Int32, false),
+                ArrowField::new("c", DataType::Int32, true),
                 ArrowField::new("b", DataType::Int32, true),
             ])),
             true,
@@ -1097,7 +1320,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             reordered_children.explain_difference(&expected, &opts),
-            Some("`a` field order mismatch, expected [b, c] but was [c, b]".to_string())
+            Some("`a` had mismatched children: fields in different order, expected: [b, c], actual: [c, b]".to_string())
         );
 
         let multiple_wrongs: Field = ArrowField::new(
@@ -1113,7 +1336,7 @@ mod tests {
         assert_eq!(
             multiple_wrongs.explain_difference(&expected, &opts),
             Some(
-                "expected name 'a' but name was 'c', `c.c` should have type int32 but type was float"
+                "expected name 'a' but name was 'c', `c` had mismatched children: `c.c` should have type int32 but type was float"
                     .to_string()
             )
         );
@@ -1195,5 +1418,37 @@ mod tests {
             no_id.explain_difference(&expected, &compare_ids),
             Some("`a` should have id 0 but id was -1".to_string())
         );
+    }
+
+    #[test]
+    pub fn test_nullability_comparison() {
+        let f1 = Field::try_from(&ArrowField::new("a", DataType::Int32, true)).unwrap();
+        let f2 = Field::try_from(&ArrowField::new("a", DataType::Int32, false)).unwrap();
+
+        // By default, nullability difference is not allowed
+        assert!(!f1.compare_with_options(&f2, &SchemaCompareOptions::default()));
+
+        let ignore_nullability = SchemaCompareOptions {
+            compare_nullability: NullabilityComparison::Ignore,
+            ..Default::default()
+        };
+        let oneway_nullability = SchemaCompareOptions {
+            compare_nullability: NullabilityComparison::OneWay,
+            ..Default::default()
+        };
+        let strict_nullability = SchemaCompareOptions {
+            compare_nullability: NullabilityComparison::Strict,
+            ..Default::default()
+        };
+
+        // By default, nullability difference is not allowed
+        assert!(!f1.compare_with_options(&f2, &strict_nullability));
+        assert!(!f2.compare_with_options(&f1, &strict_nullability));
+        // One way nullability will allow the difference if expected is nullable
+        assert!(!f1.compare_with_options(&f2, &oneway_nullability));
+        assert!(f2.compare_with_options(&f1, &oneway_nullability));
+        // Finally, ignore will ignore
+        assert!(f1.compare_with_options(&f2, &ignore_nullability));
+        assert!(f2.compare_with_options(&f1, &ignore_nullability));
     }
 }

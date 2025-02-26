@@ -4,18 +4,18 @@
 //! Flat Vector Index.
 //!
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
-use itertools::Itertools;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     prefilter::PreFilter,
@@ -28,7 +28,7 @@ use crate::{
     },
 };
 
-use super::storage::{FlatStorage, FLAT_COLUMN};
+use super::storage::{FlatBinStorage, FlatFloatStorage, FLAT_COLUMN};
 
 /// A Flat index is any index that stores no metadata, and
 /// during query, it simply scans over the storage and returns the top k results
@@ -43,21 +43,23 @@ lazy_static::lazy_static! {
 }
 
 #[derive(Default)]
-pub struct FlatQueryParams {}
+pub struct FlatQueryParams {
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+}
 
 impl From<&Query> for FlatQueryParams {
-    fn from(_: &Query) -> Self {
-        Self {}
+    fn from(q: &Query) -> Self {
+        Self {
+            lower_bound: q.lower_bound,
+            upper_bound: q.upper_bound,
+        }
     }
 }
 
 impl IvfSubIndex for FlatIndex {
     type QueryParams = FlatQueryParams;
     type BuildParams = ();
-
-    fn use_residual() -> bool {
-        false
-    }
 
     fn name() -> &'static str {
         "FLAT"
@@ -75,50 +77,57 @@ impl IvfSubIndex for FlatIndex {
         &self,
         query: ArrayRef,
         k: usize,
-        _params: Self::QueryParams,
+        params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator(query);
 
-        let (row_ids, dists): (Vec<u64>, Vec<f32>) = match prefilter.is_empty() {
-            true => (0..storage.len())
-                .map(|id| OrderedNode {
-                    id: id as u32,
-                    dist: OrderedFloat(dist_calc.distance(id as u32)),
-                })
-                .sorted_unstable()
-                .take(k)
-                .map(
-                    |OrderedNode {
-                         id,
-                         dist: OrderedFloat(dist),
-                     }| (storage.row_id(id), dist),
-                )
-                .unzip(),
-            false => {
-                let filtered_row_ids = prefilter
-                    .filter_row_ids(Box::new(storage.row_ids()))
+        let mut res: Vec<_> = match prefilter.is_empty() {
+            true => {
+                let iter = dist_calc
+                    .distance_all()
                     .into_iter()
-                    .collect::<HashSet<_>>();
-                (0..storage.len())
-                    .filter(|&id| !filtered_row_ids.contains(&storage.row_id(id as u32)))
+                    .zip(0..storage.len() as u32)
+                    .map(|(dist, id)| OrderedNode {
+                        id,
+                        dist: OrderedFloat(dist),
+                    });
+
+                if params.lower_bound.is_some() || params.upper_bound.is_some() {
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
+                    iter.filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
+                        .collect()
+                } else {
+                    iter.collect()
+                }
+            }
+            false => {
+                let row_id_mask = prefilter.mask();
+                let iter = (0..storage.len())
+                    .filter(|&id| row_id_mask.selected(storage.row_id(id as u32)))
                     .map(|id| OrderedNode {
                         id: id as u32,
                         dist: OrderedFloat(dist_calc.distance(id as u32)),
-                    })
-                    .sorted_unstable()
-                    .take(k)
-                    .map(
-                        |OrderedNode {
-                             id,
-                             dist: OrderedFloat(dist),
-                         }| (storage.row_id(id), dist),
-                    )
-                    .unzip()
+                    });
+                if params.lower_bound.is_some() || params.upper_bound.is_some() {
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
+                    iter.filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
+                        .collect()
+                } else {
+                    iter.collect()
+                }
             }
         };
+        res.sort_unstable();
 
+        let (row_ids, dists): (Vec<_>, Vec<_>) = res
+            .into_iter()
+            .take(k)
+            .map(|r| (storage.row_id(r.id), r.dist.0))
+            .unzip();
         let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
 
         Ok(RecordBatch::try_new(
@@ -136,6 +145,10 @@ impl IvfSubIndex for FlatIndex {
         Self: Sized,
     {
         Ok(Self {})
+    }
+
+    fn remap(&self, _: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        Ok(self.clone())
     }
 
     fn to_batch(&self) -> Result<RecordBatch> {
@@ -170,7 +183,7 @@ impl FlatQuantizer {
 impl Quantization for FlatQuantizer {
     type BuildParams = ();
     type Metadata = FlatMetadata;
-    type Storage = FlatStorage;
+    type Storage = FlatFloatStorage;
 
     fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
         let dim = data.as_fixed_size_list().value_length();
@@ -227,6 +240,84 @@ impl TryFrom<Quantizer> for FlatQuantizer {
             Quantizer::Flat(quantizer) => Ok(quantizer),
             _ => Err(Error::invalid_input(
                 "quantizer is not FlatQuantizer",
+                location!(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct FlatBinQuantizer {
+    dim: usize,
+    distance_type: DistanceType,
+}
+
+impl FlatBinQuantizer {
+    pub fn new(dim: usize, distance_type: DistanceType) -> Self {
+        Self { dim, distance_type }
+    }
+}
+
+impl Quantization for FlatBinQuantizer {
+    type BuildParams = ();
+    type Metadata = FlatMetadata;
+    type Storage = FlatBinStorage;
+
+    fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        let dim = data.as_fixed_size_list().value_length();
+        Ok(Self::new(dim as usize, distance_type))
+    }
+
+    fn code_dim(&self) -> usize {
+        self.dim
+    }
+
+    fn column(&self) -> &'static str {
+        FLAT_COLUMN
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::FlatBin(Self {
+            dim: metadata.dim,
+            distance_type,
+        }))
+    }
+
+    fn metadata(
+        &self,
+        _: Option<crate::vector::quantizer::QuantizationMetadata>,
+    ) -> Result<serde_json::Value> {
+        let metadata = FlatMetadata { dim: self.dim };
+        Ok(serde_json::to_value(metadata)?)
+    }
+
+    fn metadata_key() -> &'static str {
+        "flat"
+    }
+
+    fn quantization_type() -> QuantizationType {
+        QuantizationType::Flat
+    }
+
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        Ok(vectors.slice(0, vectors.len()))
+    }
+}
+
+impl From<FlatBinQuantizer> for Quantizer {
+    fn from(value: FlatBinQuantizer) -> Self {
+        Self::FlatBin(value)
+    }
+}
+
+impl TryFrom<Quantizer> for FlatBinQuantizer {
+    type Error = Error;
+
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::FlatBin(quantizer) => Ok(quantizer),
+            _ => Err(Error::invalid_input(
+                "quantizer is not FlatBinQuantizer",
                 location!(),
             )),
         }

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::vector::storage::VectorStore;
 use crate::vector::{flat, hnsw};
@@ -15,14 +16,12 @@ use crate::{prefilter::PreFilter, vector::Query};
 /// A sub index for IVF index
 pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     type QueryParams: Send + Sync + for<'a> From<&'a Query>;
-    type BuildParams: Clone;
+    type BuildParams: Clone + Send + Sync;
 
     /// Load the sub index from a record batch with a single row
     fn load(data: RecordBatch) -> Result<Self>
     where
         Self: Sized;
-
-    fn use_residual() -> bool;
 
     fn name() -> &'static str;
 
@@ -48,6 +47,10 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
     fn index_vectors(storage: &impl VectorStore, params: Self::BuildParams) -> Result<Self>
+    where
+        Self: Sized;
+
+    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self>
     where
         Self: Sized;
 

@@ -16,7 +16,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
-use lance_core::utils::tokio::spawn_cpu;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::Error;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
@@ -24,6 +24,7 @@ use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{Quantization, Quantizer};
 use lance_index::vector::v3::subindex::IvfSubIndex;
@@ -37,7 +38,7 @@ use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 
@@ -49,7 +50,7 @@ use crate::Result;
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 lazy_static::lazy_static! {
-    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = num_cpus::get();
+    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = get_num_compute_intensive_cpus();
 }
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
@@ -199,10 +200,15 @@ pub(super) async fn write_pq_partitions(
                             location: location!(),
                         })?;
                 if let Some(pq_code) = pq_index.code.as_ref() {
+                    let original_pq_codes = transpose(
+                        pq_code,
+                        pq_index.pq.num_sub_vectors,
+                        pq_code.len() / pq_index.pq.code_dim(),
+                    );
                     let fsl = Arc::new(
                         FixedSizeListArray::try_new_from_values(
-                            pq_code.as_ref().clone(),
-                            pq_index.pq.num_sub_vectors() as i32,
+                            original_pq_codes,
+                            pq_index.pq.code_dim() as i32,
                         )
                         .unwrap(),
                     );
@@ -314,6 +320,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         let code_column = match &quantizer {
             Quantizer::Flat(_) => None,
+            Quantizer::FlatBin(_) => None,
             Quantizer::Product(pq) => Some(pq.column()),
             Quantizer::Scalar(_) => None,
         };
@@ -405,7 +412,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                     part_reader.schema(),
                 )
             })
-            .buffered(num_cpus::get())
+            .buffered(object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         writer.write(&batches).await?;
@@ -429,7 +436,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                         aux_part_reader.schema(),
                     )
                 })
-                .buffered(num_cpus::get())
+                .buffered(object_store.io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await?;
             std::mem::drop(aux_part_reader);
@@ -523,7 +530,7 @@ async fn build_and_write_pq_storage(
     metric_type: MetricType,
     row_ids: Arc<dyn Array>,
     code_array: Vec<Arc<dyn Array>>,
-    pq: Arc<dyn ProductQuantizer>,
+    pq: ProductQuantizer,
     mut writer: FileWriter<ManifestDescribing>,
 ) -> Result<()> {
     let storage = spawn_cpu(move || {
@@ -591,7 +598,7 @@ mod tests {
         assert_eq!(ds.get_fragments().len(), 2);
 
         let idx = ds
-            .open_vector_index(&indices[0].name, &indices[0].uuid.to_string())
+            .open_vector_index("vector", &indices[0].uuid.to_string())
             .await
             .unwrap();
         let _ivf_idx = idx

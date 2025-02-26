@@ -5,17 +5,18 @@
 //!
 //! To improve Arrow-RS ergonomic
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::{collections::HashMap, ptr::NonNull};
 
 use arrow_array::{
     cast::AsArray, Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray,
     GenericListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt32Array,
     UInt8Array,
 };
+use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
-use arrow_select::take::take;
+use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
 pub mod deepcopy;
@@ -25,6 +26,7 @@ pub mod bfloat16;
 pub mod floats;
 pub use floats::*;
 pub mod cast;
+pub mod list;
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -55,7 +57,13 @@ pub trait DataTypeExt {
     /// Returns true if the [DataType] is a dictionary type.
     fn is_dictionary(&self) -> bool;
 
+    /// Returns the byte width of the data type
+    /// Panics if the data type is not fixed stride.
     fn byte_width(&self) -> usize;
+
+    /// Returns the byte width of the data type, if it is fixed stride.
+    /// Returns None if the data type is not fixed stride.
+    fn byte_width_opt(&self) -> Option<usize>;
 }
 
 impl DataTypeExt for DataType {
@@ -101,36 +109,41 @@ impl DataTypeExt for DataType {
         matches!(self, Self::Dictionary(_, _))
     }
 
-    fn byte_width(&self) -> usize {
+    fn byte_width_opt(&self) -> Option<usize> {
         match self {
-            Self::Int8 => 1,
-            Self::Int16 => 2,
-            Self::Int32 => 4,
-            Self::Int64 => 8,
-            Self::UInt8 => 1,
-            Self::UInt16 => 2,
-            Self::UInt32 => 4,
-            Self::UInt64 => 8,
-            Self::Float16 => 2,
-            Self::Float32 => 4,
-            Self::Float64 => 8,
-            Self::Date32 => 4,
-            Self::Date64 => 8,
-            Self::Time32(_) => 4,
-            Self::Time64(_) => 8,
-            Self::Timestamp(_, _) => 8,
-            Self::Duration(_) => 8,
-            Self::Decimal128(_, _) => 16,
-            Self::Decimal256(_, _) => 32,
+            Self::Int8 => Some(1),
+            Self::Int16 => Some(2),
+            Self::Int32 => Some(4),
+            Self::Int64 => Some(8),
+            Self::UInt8 => Some(1),
+            Self::UInt16 => Some(2),
+            Self::UInt32 => Some(4),
+            Self::UInt64 => Some(8),
+            Self::Float16 => Some(2),
+            Self::Float32 => Some(4),
+            Self::Float64 => Some(8),
+            Self::Date32 => Some(4),
+            Self::Date64 => Some(8),
+            Self::Time32(_) => Some(4),
+            Self::Time64(_) => Some(8),
+            Self::Timestamp(_, _) => Some(8),
+            Self::Duration(_) => Some(8),
+            Self::Decimal128(_, _) => Some(16),
+            Self::Decimal256(_, _) => Some(32),
             Self::Interval(unit) => match unit {
-                IntervalUnit::YearMonth => 4,
-                IntervalUnit::DayTime => 8,
-                IntervalUnit::MonthDayNano => 16,
+                IntervalUnit::YearMonth => Some(4),
+                IntervalUnit::DayTime => Some(8),
+                IntervalUnit::MonthDayNano => Some(16),
             },
-            Self::FixedSizeBinary(s) => *s as usize,
-            Self::FixedSizeList(dt, s) => *s as usize * dt.data_type().byte_width(),
-            _ => panic!("Does not support get byte width on type {self}"),
+            Self::FixedSizeBinary(s) => Some(*s as usize),
+            Self::FixedSizeList(dt, s) => Some(*s as usize * dt.data_type().byte_width()),
+            _ => None,
         }
+    }
+
+    fn byte_width(&self) -> usize {
+        self.byte_width_opt()
+            .unwrap_or_else(|| panic!("Expecting fixed stride data type, found {:?}", self))
     }
 }
 
@@ -285,6 +298,14 @@ pub fn as_fixed_size_binary_array(arr: &dyn Array) -> &FixedSizeBinaryArray {
     arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap()
 }
 
+pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> + '_> {
+    match arr.data_type() {
+        DataType::Utf8 => Box::new(arr.as_string::<i32>().iter()),
+        DataType::LargeUtf8 => Box::new(arr.as_string::<i64>().iter()),
+        _ => panic!("Expecting Utf8 or LargeUtf8, found {:?}", arr.data_type()),
+    }
+}
+
 /// Extends Arrow's [RecordBatch].
 pub trait RecordBatchExt {
     /// Append a new column to this [`RecordBatch`] and returns a new RecordBatch.
@@ -328,6 +349,17 @@ pub trait RecordBatchExt {
 
     /// Merge with another [`RecordBatch`] and returns a new one.
     ///
+    /// Fields are merged based on name.  First we iterate the left columns.  If a matching
+    /// name is found in the right then we merge the two columns.  If there is no match then
+    /// we add the left column to the output.
+    ///
+    /// To merge two columns we consider the type.  If both arrays are struct arrays we recurse.
+    /// Otherwise we use the left array.
+    ///
+    /// Afterwards we add all non-matching right columns to the output.
+    ///
+    /// Note: This method likely does not handle nested fields correctly and you may want to consider
+    /// using [`merge_with_schema`] instead.
     /// ```
     /// use std::sync::Arc;
     /// use arrow_array::*;
@@ -360,6 +392,17 @@ pub trait RecordBatchExt {
     ///
     /// TODO: add merge nested fields support.
     fn merge(&self, other: &RecordBatch) -> Result<RecordBatch>;
+
+    /// Create a batch by merging columns between two batches with a given schema.
+    ///
+    /// A reference schema is used to determine the proper ordering of nested fields.
+    ///
+    /// For each field in the reference schema we look for corresponding fields in
+    /// the left and right batches.  If a field is found in both batches we recursively merge
+    /// it.
+    ///
+    /// If a field is only in the left or right batch we take it as it is.
+    fn merge_with_schema(&self, other: &RecordBatch, schema: &Schema) -> Result<RecordBatch>;
 
     /// Drop one column specified with the name and return the new [`RecordBatch`].
     ///
@@ -429,6 +472,23 @@ impl RecordBatchExt for RecordBatch {
         self.try_new_from_struct_array(merge(&left_struct_array, &right_struct_array))
     }
 
+    fn merge_with_schema(&self, other: &RecordBatch, schema: &Schema) -> Result<RecordBatch> {
+        if self.num_rows() != other.num_rows() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Attempt to merge two RecordBatch with different sizes: {} != {}",
+                self.num_rows(),
+                other.num_rows()
+            )));
+        }
+        let left_struct_array: StructArray = self.clone().into();
+        let right_struct_array: StructArray = other.clone().into();
+        self.try_new_from_struct_array(merge_with_schema(
+            &left_struct_array,
+            &right_struct_array,
+            schema.fields(),
+        ))
+    }
+
     fn drop_column(&self, name: &str) -> Result<Self> {
         let mut fields = vec![];
         let mut columns = vec![];
@@ -456,7 +516,7 @@ impl RecordBatchExt for RecordBatch {
             .position(|f| f.name() == name)
             .ok_or_else(|| ArrowError::SchemaError(format!("Field {} does not exist", name)))?;
         columns[field_i] = column;
-        Self::try_new(self.schema().clone(), columns)
+        Self::try_new(self.schema(), columns)
     }
 
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef> {
@@ -521,7 +581,6 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
     StructArray::try_new(fields.clone(), columns, None)
 }
 
-/// Merge the fields and columns of two RecordBatch's recursively
 fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> StructArray {
     let mut fields: Vec<Field> = vec![];
     let mut columns: Vec<ArrayRef> = vec![];
@@ -595,6 +654,77 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
     StructArray::from(zipped)
 }
 
+fn merge_with_schema(
+    left_struct_array: &StructArray,
+    right_struct_array: &StructArray,
+    fields: &Fields,
+) -> StructArray {
+    // Helper function that returns true if both types are struct or both are non-struct
+    fn same_type_kind(left: &DataType, right: &DataType) -> bool {
+        match (left, right) {
+            (DataType::Struct(_), DataType::Struct(_)) => true,
+            (DataType::Struct(_), _) => false,
+            (_, DataType::Struct(_)) => false,
+            _ => true,
+        }
+    }
+
+    let mut output_fields: Vec<Field> = Vec::with_capacity(fields.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+
+    let left_fields = left_struct_array.fields();
+    let left_columns = left_struct_array.columns();
+    let right_fields = right_struct_array.fields();
+    let right_columns = right_struct_array.columns();
+
+    for field in fields {
+        let left_match_idx = left_fields.iter().position(|f| {
+            f.name() == field.name() && same_type_kind(f.data_type(), field.data_type())
+        });
+        let right_match_idx = right_fields.iter().position(|f| {
+            f.name() == field.name() && same_type_kind(f.data_type(), field.data_type())
+        });
+
+        match (left_match_idx, right_match_idx) {
+            (None, Some(right_idx)) => {
+                output_fields.push(right_fields[right_idx].as_ref().clone());
+                columns.push(right_columns[right_idx].clone());
+            }
+            (Some(left_idx), None) => {
+                output_fields.push(left_fields[left_idx].as_ref().clone());
+                columns.push(left_columns[left_idx].clone());
+            }
+            (Some(left_idx), Some(right_idx)) => {
+                if let DataType::Struct(child_fields) = field.data_type() {
+                    let left_sub_array = left_columns[left_idx].as_struct();
+                    let right_sub_array = right_columns[right_idx].as_struct();
+                    let merged_sub_array =
+                        merge_with_schema(left_sub_array, right_sub_array, child_fields);
+                    output_fields.push(Field::new(
+                        field.name(),
+                        merged_sub_array.data_type().clone(),
+                        field.is_nullable(),
+                    ));
+                    columns.push(Arc::new(merged_sub_array) as ArrayRef);
+                } else {
+                    output_fields.push(left_fields[left_idx].as_ref().clone());
+                    columns.push(left_columns[left_idx].clone());
+                }
+            }
+            (None, None) => {
+                // The field will not be included in the output
+            }
+        }
+    }
+
+    let zipped: Vec<(FieldRef, ArrayRef)> = output_fields
+        .into_iter()
+        .map(Arc::new)
+        .zip(columns)
+        .collect::<Vec<_>>();
+    StructArray::from(zipped)
+}
+
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {
     if components.is_empty() {
         return Some(array);
@@ -608,10 +738,99 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
         .and_then(|arr| get_sub_array(arr, &components[1..]))
 }
 
+/// Interleave multiple RecordBatches into a single RecordBatch.
+///
+/// Behaves like [`arrow::compute::interleave`], but for RecordBatches.
+pub fn interleave_batches(
+    batches: &[RecordBatch],
+    indices: &[(usize, usize)],
+) -> Result<RecordBatch> {
+    let first_batch = batches.first().ok_or_else(|| {
+        ArrowError::InvalidArgumentError("Cannot interleave zero RecordBatches".to_string())
+    })?;
+    let schema = first_batch.schema();
+    let num_columns = first_batch.num_columns();
+    let mut columns = Vec::with_capacity(num_columns);
+    let mut chunks = Vec::with_capacity(batches.len());
+
+    for i in 0..num_columns {
+        for batch in batches {
+            chunks.push(batch.column(i).as_ref());
+        }
+        let new_column = interleave(&chunks, indices)?;
+        columns.push(new_column);
+        chunks.clear();
+    }
+
+    RecordBatch::try_new(schema, columns)
+}
+
+pub trait BufferExt {
+    /// Create an `arrow_buffer::Buffer`` from a `bytes::Bytes` object
+    ///
+    /// The alignment must be specified (as `bytes_per_value`) since we want to make
+    /// sure we can safely reinterpret the buffer.
+    ///
+    /// If the buffer is properly aligned this will be zero-copy.  If not, a copy
+    /// will be made and an owned buffer returned.
+    ///
+    /// If `bytes_per_value` is not a power of two, then we assume the buffer is
+    /// never going to be reinterpreted into another type and we can safely
+    /// ignore the alignment.
+    ///
+    /// Yes, the method name is odd.  It's because there is already a `from_bytes`
+    /// which converts from `arrow_buffer::bytes::Bytes` (not `bytes::Bytes`)
+    fn from_bytes_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> Self;
+
+    /// Allocates a new properly aligned arrow buffer and copies `bytes` into it
+    ///
+    /// `size_bytes` can be larger than `bytes` and, if so, the trailing bytes will
+    /// be zeroed out.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size_bytes` is less than `bytes.len()`
+    fn copy_bytes_bytes(bytes: bytes::Bytes, size_bytes: usize) -> Self;
+}
+
+fn is_pwr_two(n: u64) -> bool {
+    n & (n - 1) == 0
+}
+
+impl BufferExt for arrow_buffer::Buffer {
+    fn from_bytes_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> Self {
+        if is_pwr_two(bytes_per_value) && bytes.as_ptr().align_offset(bytes_per_value as usize) != 0
+        {
+            // The original buffer is not aligned, cannot zero-copy
+            let size_bytes = bytes.len();
+            Self::copy_bytes_bytes(bytes, size_bytes)
+        } else {
+            // The original buffer is aligned, can zero-copy
+            // SAFETY: the alignment is correct we can make this conversion
+            unsafe {
+                Self::from_custom_allocation(
+                    NonNull::new(bytes.as_ptr() as _).expect("should be a valid pointer"),
+                    bytes.len(),
+                    Arc::new(bytes),
+                )
+            }
+        }
+    }
+
+    fn copy_bytes_bytes(bytes: bytes::Bytes, size_bytes: usize) -> Self {
+        assert!(size_bytes >= bytes.len());
+        let mut buf = MutableBuffer::with_capacity(size_bytes);
+        let to_fill = size_bytes - bytes.len();
+        buf.extend(bytes);
+        buf.extend(std::iter::repeat(0_u8).take(to_fill));
+        Self::from(buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{new_empty_array, Int32Array, StringArray};
 
     #[test]
     fn test_merge_recursive() {
@@ -699,6 +918,49 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_with_schema() {
+        fn test_batch(names: &[&str], types: &[DataType]) -> (Schema, RecordBatch) {
+            let fields: Fields = names
+                .iter()
+                .zip(types)
+                .map(|(name, ty)| Field::new(name.to_string(), ty.clone(), false))
+                .collect();
+            let schema = Schema::new(vec![Field::new(
+                "struct",
+                DataType::Struct(fields.clone()),
+                false,
+            )]);
+            let children = types.iter().map(new_empty_array).collect::<Vec<_>>();
+            let batch = RecordBatch::try_new(
+                Arc::new(schema.clone()),
+                vec![Arc::new(StructArray::new(fields, children, None)) as ArrayRef],
+            );
+            (schema, batch.unwrap())
+        }
+
+        let (_, left_batch) = test_batch(&["a", "b"], &[DataType::Int32, DataType::Int64]);
+        let (_, right_batch) = test_batch(&["c", "b"], &[DataType::Int32, DataType::Int64]);
+        let (output_schema, _) = test_batch(
+            &["b", "a", "c"],
+            &[DataType::Int64, DataType::Int32, DataType::Int32],
+        );
+
+        // If we use merge_with_schema the schema is respected
+        let merged = left_batch
+            .merge_with_schema(&right_batch, &output_schema)
+            .unwrap();
+        assert_eq!(merged.schema().as_ref(), &output_schema);
+
+        // If we use merge we get first-come first-serve based on the left batch
+        let (naive_schema, _) = test_batch(
+            &["a", "b", "c"],
+            &[DataType::Int32, DataType::Int64, DataType::Int32],
+        );
+        let merged = left_batch.merge(&right_batch).unwrap();
+        assert_eq!(merged.schema().as_ref(), &naive_schema);
+    }
+
+    #[test]
     fn test_take_record_batch() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, true),
@@ -739,7 +1001,7 @@ mod tests {
             .with_metadata(metadata.clone().into()),
         );
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
                 Arc::new(Int32Array::from_iter_values(0..20)),
                 Arc::new(StringArray::from_iter_values(
@@ -784,7 +1046,7 @@ mod tests {
         // Sub schema
         let sub_schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
         let sub_projected = batch.project_by_schema(&sub_schema).unwrap();
-        let expected_schema = Arc::new(sub_schema.with_metadata(metadata.clone().into()));
+        let expected_schema = Arc::new(sub_schema.with_metadata(metadata.into()));
         assert_eq!(
             sub_projected,
             RecordBatch::try_new(

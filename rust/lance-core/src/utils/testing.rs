@@ -11,15 +11,14 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
-    Error as OSError, GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore,
-    PutOptions, PutResult, Result as OSResult,
+    Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OSResult,
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::io::AsyncWrite;
 
 // A policy function takes in the name of the operation (e.g. "put") and the location
 // that is being accessed / modified and returns an optional error.
@@ -58,7 +57,7 @@ pub struct ProxyObjectStorePolicy {
     /// be returned instead.
     before_policies: HashMap<String, PolicyFn>,
     /// Policies which run after calls that return ObjectMeta.  The policy can
-    /// tranform the returned ObjectMeta to mock out file listing results.
+    /// transform the returned ObjectMeta to mock out file listing results.
     object_meta_policies: HashMap<String, ObjectMetaPolicyFn>,
 }
 
@@ -125,32 +124,23 @@ impl std::fmt::Display for ProxyObjectStore {
 
 #[async_trait]
 impl ObjectStore for ProxyObjectStore {
-    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
-        self.before_method("put", location)?;
-        self.target.put(location, bytes).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
-        bytes: Bytes,
+        bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         self.before_method("put", location)?;
         self.target.put_opts(location, bytes, opts).await
     }
 
-    async fn put_multipart(
+    async fn put_multipart_opts(
         &self,
         location: &Path,
-    ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+        opts: PutMultipartOpts,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
         self.before_method("put_multipart", location)?;
-        self.target.put_multipart(location).await
-    }
-
-    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
-        self.before_method("abort_multipart", location)?;
-        self.target.abort_multipart(location, multipart_id).await
+        self.target.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -228,7 +218,7 @@ impl Default for MockClock<'_> {
     }
 }
 
-impl<'a> MockClock<'a> {
+impl MockClock<'_> {
     pub fn new() -> Self {
         Default::default()
     }
@@ -238,7 +228,7 @@ impl<'a> MockClock<'a> {
     }
 }
 
-impl<'a> Drop for MockClock<'a> {
+impl Drop for MockClock<'_> {
     fn drop(&mut self) {
         // Reset the clock to the epoch
         mock_instant::MockClock::set_system_time(TimeDelta::try_days(0).unwrap().to_std().unwrap());

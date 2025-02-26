@@ -12,8 +12,8 @@ use datafusion::{
     common::Statistics,
     execution::context::TaskContext,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties,
-        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
@@ -27,9 +27,10 @@ pub struct TestingExec {
 impl TestingExec {
     pub(crate) fn new(batches: Vec<RecordBatch>) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(batches[0].schema().clone()),
+            EquivalenceProperties::new(batches[0].schema()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             batches,
@@ -47,6 +48,10 @@ impl DisplayAs for TestingExec {
 }
 
 impl ExecutionPlan for TestingExec {
+    fn name(&self) -> &str {
+        "TestingExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -55,7 +60,7 @@ impl ExecutionPlan for TestingExec {
         self.batches[0].schema()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 

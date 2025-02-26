@@ -4,10 +4,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use lance_core::Result;
 
 use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
 use lance_table::format::Index;
+use uuid::Uuid;
 
 // Extends Lance Dataset with secondary index.
 #[async_trait]
@@ -32,6 +34,15 @@ pub trait DatasetIndexExt {
         params: &dyn IndexParams,
         replace: bool,
     ) -> Result<()>;
+
+    /// Drop indices by name.
+    ///
+    /// Upon finish, a new dataset version is generated.
+    ///
+    /// Parameters:
+    ///
+    /// - `name`: the name of the index to drop.
+    async fn drop_index(&mut self, name: &str) -> Result<()>;
 
     /// Read all indices of this Dataset version.
     ///
@@ -80,4 +91,18 @@ pub trait DatasetIndexExt {
     ///
     /// If the index does not exist, return Error.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
+
+    async fn commit_existing_index(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        index_id: Uuid,
+    ) -> Result<()>;
+
+    async fn read_index_partition(
+        &self,
+        index_name: &str,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream>;
 }

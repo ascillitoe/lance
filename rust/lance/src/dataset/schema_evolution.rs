@@ -6,14 +6,18 @@ use std::{collections::HashSet, sync::Arc};
 use crate::io::commit::commit_transaction;
 use crate::{io::exec::Planner, Error, Result};
 use arrow::compute::CastOptions;
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
+use lance_datafusion::utils::StreamingWriteSource;
+use lance_encoding::version::LanceFileVersion;
 use lance_table::format::Fragment;
-use snafu::{location, Location};
+use snafu::location;
 
+use super::fragment::FileFragment;
 use super::{
     transaction::{Operation, Transaction},
     Dataset,
@@ -53,6 +57,12 @@ pub enum NewColumnTransform {
     BatchUDF(BatchUDF),
     /// A set of SQL expressions that define new columns.
     SqlExpressions(Vec<(String, String)>),
+    /// A stream of RecordBatches that define new columns.
+    Stream(SendableRecordBatchStream),
+    /// An iterator of RecordBatches that define new columns.
+    Reader(Box<dyn RecordBatchReader + Send>),
+    /// Add new columns that are initially all null
+    AllNulls(Arc<ArrowSchema>),
 }
 
 /// Definition of a change to a column in a dataset
@@ -117,23 +127,45 @@ fn is_upcast_downcast(from_type: &DataType, to_type: &DataType) -> bool {
     }
 }
 
-pub(super) async fn add_columns(
-    dataset: &mut Dataset,
+pub(super) async fn add_columns_to_fragments(
+    dataset: &Dataset,
     transforms: NewColumnTransform,
     read_columns: Option<Vec<String>>,
-) -> Result<()> {
-    // We just transform the SQL expression into a UDF backed by DataFusion
-    // physical expressions.
-    let (
-        BatchUDF {
-            mapper,
-            output_schema,
-            result_checkpoint,
-        },
-        read_columns,
-    ) = match transforms {
-        NewColumnTransform::BatchUDF(udf) => (udf, read_columns),
+    fragments: &[FileFragment],
+    batch_size: Option<u32>,
+) -> Result<(Vec<Fragment>, Schema)> {
+    // Check names early (before calling add_columns_impl) to avoid extra work if
+    // the names are wrong.
+    let check_names = |output_schema: &ArrowSchema| {
+        let new_names = output_schema.field_names();
+        for field in &dataset.schema().fields {
+            if new_names.contains(&&field.name) {
+                return Err(Error::invalid_input(
+                    format!("Column {} already exists in the dataset", field.name),
+                    location!(),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    let (output_schema, fragments) = match transforms {
+        NewColumnTransform::BatchUDF(udf) => {
+            check_names(udf.output_schema.as_ref())?;
+            let fragments = add_columns_impl(
+                fragments,
+                read_columns,
+                udf.mapper,
+                batch_size,
+                udf.result_checkpoint,
+                None,
+            )
+            .await?;
+            Result::Ok((udf.output_schema, fragments))
+        }
         NewColumnTransform::SqlExpressions(expressions) => {
+            // We just transform the SQL expression into a UDF backed by DataFusion
+            // physical expressions.
             let arrow_schema = Arc::new(ArrowSchema::from(dataset.schema()));
             let planner = Planner::new(arrow_schema);
             let exprs = expressions
@@ -176,6 +208,7 @@ pub(super) async fn add_columns(
                     })
                     .collect::<Result<Vec<_>>>()?,
             ));
+            check_names(output_schema.as_ref())?;
 
             let schema_ref = output_schema.clone();
             let mapper = move |batch: &RecordBatch| {
@@ -191,62 +224,123 @@ pub(super) async fn add_columns(
             let mapper = Box::new(mapper);
 
             let read_columns = Some(read_schema.field_names().into_iter().cloned().collect());
-            (
-                BatchUDF {
-                    mapper,
-                    output_schema,
-                    result_checkpoint: None,
-                },
-                read_columns,
-            )
+            let fragments =
+                add_columns_impl(fragments, read_columns, mapper, batch_size, None, None).await?;
+            Ok((output_schema, fragments))
         }
-    };
+        NewColumnTransform::Stream(stream) => {
+            let output_schema = stream.schema();
+            check_names(output_schema.as_ref())?;
+            let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
+            Ok((output_schema, fragments))
+        }
+        NewColumnTransform::Reader(reader) => {
+            let output_schema = reader.schema();
+            check_names(output_schema.as_ref())?;
+            let stream = reader.into_stream();
+            let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
+            Ok((output_schema, fragments))
+        }
+        NewColumnTransform::AllNulls(output_schema) => {
+            check_names(output_schema.as_ref())?;
 
-    {
-        let new_names = output_schema.field_names();
-        for field in &dataset.schema().fields {
-            if new_names.contains(&&field.name) {
-                return Err(Error::invalid_input(
-                    format!("Column {} already exists in the dataset", field.name),
-                    location!(),
-                ));
+            // Check that the schema is compatible considering all the new columns must be nullable
+            let schema = Schema::try_from(output_schema.as_ref())?;
+            if !schema.all_fields_nullable() {
+                return Err(Error::InvalidInput {
+                    source: "All-null columns must be nullable.".into(),
+                    location: location!(),
+                });
             }
+
+            let fragments = fragments
+                .iter()
+                .map(|f| f.metadata.clone())
+                .collect::<Vec<_>>();
+
+            // Check if any of the fragment's files are using the legacy dataset version if so, we
+            // can't add all-null columns as a metadata-only operation. The reason is because we
+            // use the NullReader for fragments that have missing columns and we can't mix legacy
+            // and non-legacy readers when reading the fragment.
+            if fragments.iter().any(|fragment| {
+                fragment.files.iter().any(|file| {
+                    matches!(
+                        LanceFileVersion::try_from_major_minor(
+                            file.file_major_version,
+                            file.file_minor_version
+                        ),
+                        Ok(LanceFileVersion::Legacy)
+                    )
+                })
+            }) {
+                return Err(Error::NotSupported {
+                    source: "Cannot add all-null columns to legacy dataset version.".into(),
+                    location: location!(),
+                });
+            }
+
+            Ok((output_schema, fragments))
         }
-    }
+    }?;
 
     let mut schema = dataset.schema().merge(output_schema.as_ref())?;
     schema.set_field_id(Some(dataset.manifest.max_field_id()));
 
-    let fragments =
-        add_columns_impl(dataset, read_columns, mapper, result_checkpoint, None).await?;
+    Ok((fragments, schema))
+}
+
+pub(super) async fn add_columns(
+    dataset: &mut Dataset,
+    transforms: NewColumnTransform,
+    read_columns: Option<Vec<String>>,
+    batch_size: Option<u32>,
+) -> Result<()> {
+    let (fragments, schema) = add_columns_to_fragments(
+        dataset,
+        transforms,
+        read_columns,
+        &dataset.get_fragments(),
+        batch_size,
+    )
+    .await?;
+
     let operation = Operation::Merge { fragments, schema };
-    let transaction = Transaction::new(dataset.manifest.version, operation, None);
-    let new_manifest = commit_transaction(
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        operation,
+        // TODO: Make it possible to add new blob columns
+        /*blob_op= */ None,
+        None,
+    );
+    let (new_manifest, new_path) = commit_transaction(
         dataset,
         &dataset.object_store,
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 
     dataset.manifest = Arc::new(new_manifest);
+    dataset.manifest_file = new_path;
 
     Ok(())
 }
 
 #[allow(clippy::type_complexity)]
 async fn add_columns_impl(
-    dataset: &Dataset,
+    fragments: &[FileFragment],
     read_columns: Option<Vec<String>>,
     mapper: Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>,
+    batch_size: Option<u32>,
     result_cache: Option<Arc<dyn UDFCheckpointStore>>,
     schemas: Option<(Schema, Schema)>,
 ) -> Result<Vec<Fragment>> {
     let read_columns_ref = read_columns.as_deref();
     let mapper_ref = mapper.as_ref();
-    let fragments = futures::stream::iter(dataset.get_fragments())
+    let fragments = futures::stream::iter(fragments)
         .then(|fragment| {
             let cache_ref = result_cache.clone();
             let schemas_ref = &schemas;
@@ -260,7 +354,7 @@ async fn add_columns_impl(
                 }
 
                 let mut updater = fragment
-                    .updater(read_columns_ref, schemas_ref.clone())
+                    .updater(read_columns_ref, schemas_ref.clone(), batch_size)
                     .await?;
 
                 let mut batch_index = 0;
@@ -302,6 +396,68 @@ async fn add_columns_impl(
     Ok(fragments)
 }
 
+async fn add_columns_from_stream(
+    fragments: &[FileFragment],
+    mut stream: SendableRecordBatchStream,
+    schemas: Option<(Schema, Schema)>,
+    batch_size: Option<u32>,
+) -> Result<Vec<Fragment>> {
+    let mut new_fragments = Vec::with_capacity(fragments.len());
+    let mut last_seen_batch: Option<RecordBatch> = None;
+    for fragment in fragments {
+        let mut updater = fragment
+            .updater::<String>(Some(&[]), schemas.clone(), batch_size)
+            .await?;
+        while let Some(batch) = updater.next().await? {
+            debug_assert_eq!(batch.num_columns(), 1);
+            let mut rows_remaining = batch.num_rows();
+
+            let mut batches = Vec::new();
+
+            while rows_remaining > 0 {
+                let next_batch = if let Some(last_seen_batch) = last_seen_batch {
+                    last_seen_batch
+                } else {
+                    stream.next().await.ok_or_else(|| {
+                        Error::invalid_input(
+                            "Stream ended before producing values for all rows in dataset",
+                            location!(),
+                        )
+                    })??
+                };
+                let num_rows = next_batch.num_rows();
+                if num_rows > rows_remaining {
+                    let new_batch = next_batch.slice(0, rows_remaining);
+                    batches.push(new_batch);
+                    last_seen_batch =
+                        Some(next_batch.slice(rows_remaining, num_rows - rows_remaining));
+                    rows_remaining = 0;
+                } else {
+                    batches.push(next_batch);
+                    rows_remaining -= num_rows;
+                    last_seen_batch = None;
+                }
+            }
+
+            let new_batch =
+                arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
+
+            updater.update(new_batch).await?;
+        }
+        new_fragments.push(updater.finish().await?);
+    }
+
+    // Ensure the stream is fully consumed
+    if last_seen_batch.is_some() || stream.next().await.is_some() {
+        return Err(Error::InvalidInput {
+            source: "Stream produced more values than expected for dataset".into(),
+            location: location!(),
+        });
+    }
+
+    Ok(new_fragments)
+}
+
 /// Modify columns in the dataset, changing their name, type, or nullability.
 ///
 /// If a column has an index, it's index will be preserved.
@@ -328,6 +484,18 @@ pub(super) async fn alter_columns(
                 location!(),
             )
         })?;
+
+        if !field_src.is_default_storage() {
+            return Err(Error::NotSupported {
+                source: format!(
+                    "Column \"{}\" is not a default storage column and cannot yet be altered",
+                    alteration.path
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+
         if let Some(nullable) = alteration.nullable {
             // TODO: in the future, we could check the values of the column to see if
             //       they are all non-null and thus the column could be made non-nullable.
@@ -384,6 +552,8 @@ pub(super) async fn alter_columns(
         Transaction::new(
             dataset.manifest.version,
             Operation::Project { schema: new_schema },
+            // TODO: Make it possible to alter blob columns
+            /*blob_op= */ None,
             None,
         )
     } else {
@@ -402,7 +572,7 @@ pub(super) async fn alter_columns(
             .map(|(_old, new)| new.id)
             .collect::<Vec<_>>();
         // This schema contains the exact field ids we want to write the new fields with.
-        let new_col_schema = new_schema.project_by_ids(&new_ids);
+        let new_col_schema = new_schema.project_by_ids(&new_ids, true);
 
         let mapper = move |batch: &RecordBatch| {
             let mut fields = Vec::with_capacity(cast_fields.len());
@@ -427,9 +597,10 @@ pub(super) async fn alter_columns(
         let mapper = Box::new(mapper);
 
         let fragments = add_columns_impl(
-            dataset,
+            &dataset.get_fragments(),
             Some(read_columns),
             mapper,
+            None,
             None,
             Some((new_col_schema, new_schema.clone())),
         )
@@ -456,23 +627,26 @@ pub(super) async fn alter_columns(
                 schema: new_schema,
                 fragments,
             },
+            /*blob_op= */ None,
             None,
         )
     };
 
     // TODO: adjust the indices here for the new schema
 
-    let manifest = commit_transaction(
+    let (manifest, manifest_path) = commit_transaction(
         dataset,
         &dataset.object_store,
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 
     dataset.manifest = Arc::new(manifest);
+    dataset.manifest_file = manifest_path;
 
     Ok(())
 }
@@ -482,11 +656,22 @@ pub(super) async fn alter_columns(
 /// This is a metadata-only operation and does not remove the data from the
 /// underlying storage. In order to remove the data, you must subsequently
 /// call `compact_files` to rewrite the data without the removed columns and
-/// then call `cleanup_files` to remove the old files.
+/// then call `cleanup_old_versions` to remove the old files.
 pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Result<()> {
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {
-        if dataset.schema().field(col).is_none() {
+        if let Some(field) = dataset.schema().field(col) {
+            if !field.is_default_storage() {
+                return Err(Error::NotSupported {
+                    source: format!(
+                        "Column \"{}\" is not a default storage column and cannot yet be dropped",
+                        col
+                    )
+                    .into(),
+                    location: location!(),
+                });
+            }
+        } else {
             return Err(Error::invalid_input(
                 format!("Column {} does not exist in the dataset", col),
                 location!(),
@@ -507,20 +692,23 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::Project { schema: new_schema },
+        /*blob_op= */ None,
         None,
     );
 
-    let manifest = commit_transaction(
+    let (manifest, manifest_path) = commit_transaction(
         dataset,
         &dataset.object_store,
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 
     dataset.manifest = Arc::new(manifest);
+    dataset.manifest_file = manifest_path;
 
     Ok(())
 }
@@ -534,6 +722,7 @@ mod test {
     use super::*;
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::Fields as ArrowFields;
+    use lance_file::version::LanceFileVersion;
     use rstest::rstest;
 
     // Used to validate that futures returned are Send.
@@ -561,7 +750,7 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                use_legacy_format: true,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
@@ -571,6 +760,7 @@ mod test {
         // Adding a duplicate column name will break
         let fut = dataset.add_columns(
             NewColumnTransform::SqlExpressions(vec![("id".into(), "id + 1".into())]),
+            None,
             None,
         );
         // (Quick validation that the future is Send)
@@ -582,6 +772,7 @@ mod test {
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![("value".into(), "2 * random()".into())]),
                 None,
+                None,
             )
             .await?;
 
@@ -589,6 +780,7 @@ mod test {
         dataset
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![("double_id".into(), "2 * id".into())]),
+                None,
                 None,
             )
             .await?;
@@ -600,6 +792,7 @@ mod test {
                     "triple_id".into(),
                     "id + double_id".into(),
                 )]),
+                None,
                 None,
             )
             .await?;
@@ -622,7 +815,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_append_columns_udf(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_append_columns_udf(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         use arrow_array::Float64Array;
 
         let num_rows = 5;
@@ -644,7 +840,7 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -661,7 +857,7 @@ mod test {
             )])),
             result_checkpoint: None,
         });
-        let res = dataset.add_columns(transforms, None).await;
+        let res = dataset.add_columns(transforms, None, None).await;
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         // Can add a column that independent (empty read_schema)
@@ -684,7 +880,7 @@ mod test {
             output_schema,
             result_checkpoint: None,
         });
-        dataset.add_columns(transforms, None).await?;
+        dataset.add_columns(transforms, None, None).await?;
 
         // Can add a column that depends on another column (double id)
         let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -711,7 +907,7 @@ mod test {
             output_schema,
             result_checkpoint: None,
         });
-        dataset.add_columns(transforms, None).await?;
+        dataset.add_columns(transforms, None, None).await?;
         // These can be read back, the dataset is valid
         dataset.validate().await?;
 
@@ -750,7 +946,7 @@ mod test {
             Some(WriteParams {
                 max_rows_per_file: 50,
                 max_rows_per_group: 25,
-                use_legacy_format: true,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
@@ -838,7 +1034,7 @@ mod test {
             output_schema,
             result_checkpoint: Some(request_counter.clone()),
         });
-        dataset.add_columns(transforms, None).await?;
+        dataset.add_columns(transforms, None, None).await?;
 
         // Should have requested both fragments
         assert_eq!(
@@ -893,9 +1089,137 @@ mod test {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_add_column_all_nulls() -> Result<()> {
+        let num_rows = 100;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = tempfile::tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.validate().await?;
+
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "nulls",
+                    DataType::Int32,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("nulls", DataType::Int32, true),
+        ]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows as usize);
+
+        // check that can't add non-nullable columns
+        let err =
+            dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("non_nulls", DataType::Int32, false),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("All-null columns must be nullable."));
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("nulls", DataType::Int32, true),
+        ]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows as usize);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_column_all_nulls_legacy() -> Result<()> {
+        let num_rows = 100;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = tempfile::tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.validate().await?;
+
+        let err =
+            dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("nulls", DataType::Int32, true),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Cannot add all-null columns to legacy dataset version"));
+
+        Ok(())
+    }
+
     #[rstest]
     #[tokio::test]
-    async fn test_rename_columns(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_rename_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         use std::collections::HashMap;
 
         use arrow_array::{ArrayRef, StructArray};
@@ -937,7 +1261,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1009,18 +1333,21 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_cast_column(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_cast_column(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         // Create a table with 2 scalar columns, 1 vector column
 
         use arrow::datatypes::{Int32Type, Int64Type};
         use arrow_array::{Float16Array, Float32Array, Int64Array, ListArray};
         use half::f16;
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::{DatasetIndexExt, IndexType};
+        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
         use lance_linalg::distance::MetricType;
         use lance_testing::datagen::generate_random_array;
 
-        use crate::index::{scalar::ScalarIndexParams, vector::VectorIndexParams};
+        use crate::index::vector::VectorIndexParams;
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, false),
             ArrowField::new("f", DataType::Float32, false),
@@ -1061,7 +1388,7 @@ mod test {
             RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1212,7 +1539,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_drop_columns(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_drop_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         use std::collections::HashMap;
 
         use arrow_array::{ArrayRef, Float32Array, StructArray};
@@ -1261,7 +1591,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1306,7 +1636,10 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_drop_add_columns(#[values(false, true)] use_legacy_format: bool) -> Result<()> {
+    async fn test_drop_add_columns(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -1323,7 +1656,7 @@ mod test {
             batches,
             test_uri,
             Some(WriteParams {
-                use_legacy_format,
+                data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
         )
@@ -1336,6 +1669,7 @@ mod test {
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![("x".into(), "i + 1".into())]),
                 Some(vec!["i".into()]),
+                None,
             )
             .await?;
         assert_eq!(dataset.manifest.max_field_id(), 1);
@@ -1347,6 +1681,7 @@ mod test {
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![("y".into(), "2 * i".into())]),
                 Some(vec!["i".into()]),
+                None,
             )
             .await?;
         assert_eq!(dataset.manifest.max_field_id(), 1);
@@ -1372,6 +1707,7 @@ mod test {
                     ("b".into(), "i + 7".into()),
                 ]),
                 Some(vec!["i".into()]),
+                None,
             )
             .await?;
         assert_eq!(dataset.manifest.max_field_id(), 2);
@@ -1385,6 +1721,7 @@ mod test {
             .add_columns(
                 NewColumnTransform::SqlExpressions(vec![("c".into(), "i + 11".into())]),
                 Some(vec!["i".into()]),
+                None,
             )
             .await?;
         assert_eq!(dataset.manifest.max_field_id(), 3);

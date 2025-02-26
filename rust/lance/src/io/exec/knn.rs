@@ -8,68 +8,50 @@ use arrow::datatypes::UInt32Type;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
-    ArrayRef, RecordBatch, StringArray, UInt64Array, Array,
+    ArrayRef, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use async_trait::async_trait;
-use datafusion::common::stats::Precision;
+use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::{
     stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion::physical_plan::{ExecutionMode, PlanProperties};
+use datafusion::{
+    common::stats::Precision,
+    physical_plan::execution_plan::{Boundedness, EmissionType},
+};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
 use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
-use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
 use lance_index::vector::{
     flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
+use crate::index::vector::utils::get_vector_type;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
 
-/// Check vector column exists and has the correct data type.
-fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
-    let field = schema.field_with_name(column).map_err(|_| {
-        Error::io(
-            format!("Query column '{}' not found in input schema", column),
-            location!(),
-        )
-    })?;
-    match field.data_type() {
-        DataType::FixedSizeList(list_field, _)
-            if matches!(
-                list_field.data_type(),
-                DataType::UInt8 | DataType::Float16 | DataType::Float32 | DataType::Float64
-            ) => Ok(()),
-        _ => {
-           Err(Error::io(
-                format!(
-                    "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
-                    column, field.data_type()
-                ),
-                location!(),
-            ))
-        }
-    }
-}
+use super::utils::{FilteredRowIdsToPrefilter, PreFilterSource, SelectionVectorToPrefilter,
+    DirectRowIdFilterLoader};
 
 /// [ExecutionPlan] compute vector distance from a query vector.
 ///
 /// Preconditions:
 /// - `input` schema must contains `query.column`,
 /// - The column must be a vector column.
+///
+/// WARNING: Internal API with no stability guarantees.
 #[derive(Debug)]
 pub struct KNNVectorDistanceExec {
     /// Inner input node.
@@ -105,7 +87,7 @@ impl KNNVectorDistanceExec {
         distance_type: DistanceType,
     ) -> Result<Self> {
         let mut output_schema = input.schema().as_ref().clone();
-        check_vector_column(&output_schema, column)?;
+        get_vector_type(&(&output_schema).try_into()?, column)?;
 
         // FlatExec appends a distance column to the input schema. The input
         // may already have a distance column (possibly in the wrong position), so
@@ -113,12 +95,11 @@ impl KNNVectorDistanceExec {
         if output_schema.column_with_name(DIST_COL).is_some() {
             output_schema = output_schema.without_column(DIST_COL);
         }
-        let output_schema = Arc::new(Schema::new(
-            output_schema
-                .try_with_column(Field::new(DIST_COL, DataType::Float32, true))
-                .unwrap()
-                .fields,
-        ));
+        let output_schema = Arc::new(output_schema.try_with_column(Field::new(
+            DIST_COL,
+            DataType::Float32,
+            true,
+        ))?);
 
         // This node has the same partitioning & boundedness as the input node
         // but it destroys any ordering.
@@ -139,6 +120,10 @@ impl KNNVectorDistanceExec {
 }
 
 impl ExecutionPlan for KNNVectorDistanceExec {
+    fn name(&self) -> &str {
+        "KNNVectorDistanceExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -148,8 +133,8 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         self.output_schema.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -191,7 +176,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                         .map_err(|e| DataFusionError::Execution(e.to_string()))
                 }
             })
-            .buffer_unordered(num_cpus::get());
+            .buffer_unordered(get_num_compute_intensive_cpus());
         let schema = self.schema();
         Ok(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
@@ -201,114 +186,35 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
         let inner_stats = self.input.statistics()?;
-        let dist_col_stats = inner_stats.column_statistics[0].clone();
+        let schema = self.input.schema();
+        let dist_stats = inner_stats
+            .column_statistics
+            .iter()
+            .zip(schema.fields())
+            .find(|(_, field)| field.name() == &self.column)
+            .map(|(stats, _)| ColumnStatistics {
+                null_count: stats.null_count,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let column_statistics = inner_stats
             .column_statistics
             .into_iter()
-            .chain([dist_col_stats.clone()])
+            .zip(schema.fields())
+            .filter(|(_, field)| field.name() != DIST_COL)
+            .map(|(stats, _)| stats)
+            .chain(std::iter::once(dist_stats))
             .collect::<Vec<_>>();
         Ok(Statistics {
             num_rows: inner_stats.num_rows,
             column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
-        // self.input.statistics()
     }
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
-}
-
-// Utility to convert an input (containing row ids) into a prefilter
-struct FilteredRowIdsToPrefilter(SendableRecordBatchStream);
-
-#[async_trait]
-impl FilterLoader for FilteredRowIdsToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
-        let mut allow_list = RowIdTreeMap::new();
-        while let Some(batch) = self.0.next().await {
-            let batch = batch?;
-            let row_ids = batch.column_by_name(ROW_ID).expect(
-                "input batch missing row id column even though it is in the schema for the stream",
-            );
-            let row_ids = row_ids
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("row id column in input batch had incorrect type");
-            allow_list.extend(row_ids.iter().flatten())
-        }
-        Ok(RowIdMask::from_allowed(allow_list))
-    }
-}
-
-// Utility to convert a serialized selection vector into a prefilter
-struct SelectionVectorToPrefilter(SendableRecordBatchStream);
-
-#[async_trait]
-impl FilterLoader for SelectionVectorToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
-        let batch = self
-            .0
-            .try_next()
-            .await?
-            .ok_or_else(|| Error::Internal {
-                message: "Selection vector source for prefilter did not yield any batches".into(),
-                location: location!(),
-            })
-            .unwrap();
-        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
-            Error::Internal {
-                message: format!(
-                    "Expected selection vector input to yield binary arrays but got {}",
-                    batch["result"].data_type()
-                ),
-                location: location!(),
-            }
-        })?)
-    }
-}
-
-// Utility to convert a provided row id mask into a prefilter
-struct DirectRowIdFilterLoader {
-    row_ids: Arc<dyn Array>,
-}
-
-impl DirectRowIdFilterLoader {
-    fn new(row_ids: Arc<dyn Array>) -> Self {
-        Self { row_ids }
-    }
-}
-
-#[async_trait]
-impl FilterLoader for DirectRowIdFilterLoader {
-    async fn load(self: Box<Self>) -> Result<RowIdMask> {
-        // Attempt to downcast `Array` to a specific type, e.g., `UInt64Array`
-        let uint64_array = self.row_ids.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| Error::Internal {
-            message: format!(
-                "Expected an UInt64Array but got {}",
-                self.row_ids.data_type()
-            ),
-            location: location!(),
-        })?;
-
-        let allow_list = RowIdTreeMap::from_iter(uint64_array.iter().flatten());
-        let mask = RowIdMask::from_allowed(allow_list);
-
-        Ok(mask)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum PreFilterSource {
-    /// The prefilter input is an array of row ids that match the filter condition
-    FilteredRowIds(Arc<dyn ExecutionPlan>),
-    /// The prefilter input is a selection vector from an index query
-    ScalarIndexQuery(Arc<dyn ExecutionPlan>),
-    /// There is no prefilter
-    None,
-    /// The prefilter input is an array of row ids provided by the user
-    ProvidedRowIds(Arc<dyn Array>),
 }
 
 lazy_static::lazy_static! {
@@ -317,7 +223,7 @@ lazy_static::lazy_static! {
         ROW_ID_FIELD.clone(),
     ]));
 
-    static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
+    pub static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
         Field::new(PART_ID_COLUMN, DataType::List(Field::new("item", DataType::UInt32, false).into()), false),
         Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
     ]));
@@ -338,7 +244,7 @@ pub fn new_knn_exec(
     let sub_index = ANNIvfSubIndexExec::try_new(
         Arc::new(ivf_node),
         dataset,
-        Arc::new(indices.to_vec()),
+        indices.to_vec(),
         query.clone(),
         prefilter_source,
     )?;
@@ -362,21 +268,21 @@ pub fn new_knn_exec(
 /// ```
 #[derive(Debug)]
 pub struct ANNIvfPartitionExec {
-    dataset: Arc<Dataset>,
+    pub dataset: Arc<Dataset>,
 
     /// The vector query to execute.
-    query: Query,
+    pub query: Query,
 
     /// The UUIDs of the indices to search.
-    index_uuids: Vec<String>,
+    pub index_uuids: Vec<String>,
 
-    properties: PlanProperties,
+    pub properties: PlanProperties,
 }
 
 impl ANNIvfPartitionExec {
     pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<String>, query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
-        check_vector_column(&dataset_schema.into(), &query.column)?;
+        get_vector_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
             return Err(Error::Execution {
                 message: "ANNIVFPartitionExec node: no index found for query".to_string(),
@@ -388,7 +294,8 @@ impl ANNIvfPartitionExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
 
         Ok(Self {
@@ -417,6 +324,10 @@ impl DisplayAs for ANNIvfPartitionExec {
 }
 
 impl ExecutionPlan for ANNIvfPartitionExec {
+    fn name(&self) -> &str {
+        "ANNIVFPartitionExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -436,17 +347,21 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         &self.properties
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Internal(
-            "ANNIVFPartitionExec: with_new_children called, but no children to replace".to_string(),
-        ))
+        if !children.is_empty() {
+            Err(DataFusionError::Internal(
+                "ANNIVFPartitionExec node does not accept children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(
@@ -511,7 +426,7 @@ pub struct ANNIvfSubIndexExec {
 
     dataset: Arc<Dataset>,
 
-    indices: Arc<Vec<Index>>,
+    indices: Vec<Index>,
 
     /// Vector Query.
     query: Query,
@@ -527,7 +442,7 @@ impl ANNIvfSubIndexExec {
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
-        indices: Arc<Vec<Index>>,
+        indices: Vec<Index>,
         query: Query,
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
@@ -543,7 +458,8 @@ impl ANNIvfSubIndexExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Ok(Self {
             input,
@@ -573,6 +489,10 @@ impl DisplayAs for ANNIvfSubIndexExec {
 }
 
 impl ExecutionPlan for ANNIvfSubIndexExec {
+    fn name(&self) -> &str {
+        "ANNSubIndexExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -581,12 +501,12 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         KNN_INDEX_SCHEMA.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
-            PreFilterSource::None => vec![self.input.clone()],
-            PreFilterSource::FilteredRowIds(src) => vec![self.input.clone(), src.clone()],
-            PreFilterSource::ScalarIndexQuery(src) => vec![self.input.clone(), src.clone()],
-            PreFilterSource::ProvidedRowIds(_) => vec![self.input.clone()],
+            PreFilterSource::None => vec![&self.input],
+            PreFilterSource::FilteredRowIds(src) => vec![&self.input, &src],
+            PreFilterSource::ScalarIndexQuery(src) => vec![&self.input, &src],
+            PreFilterSource::ProvidedRowIds(_) => vec![&self.input],
         }
     }
 
@@ -594,22 +514,25 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
+        let plan = if children.len() == 1 || children.len() == 2 {
+            if children.len() == 2 {
+                let _prefilter = children.pop().expect("length checked");
+            }
+            // NOTE!!!! Prefilter transformation is ignored.
+            Self {
+                input: children.pop().expect("length checked"),
+                dataset: self.dataset.clone(),
+                indices: self.indices.clone(),
+                query: self.query.clone(),
+                prefilter_source: self.prefilter_source.clone(),
+                properties: self.properties.clone(),
+            }
+        } else {
             return Err(DataFusionError::Internal(
-                "ANNSubIndexExec node must have exactly one child".to_string(),
+                "ANNSubIndexExec node must have exactly one or two (prefilter) child".to_string(),
             ));
-        }
-
-        let new_plan = Self {
-            input: children.pop().expect("length checked"),
-            dataset: self.dataset.clone(),
-            indices: self.indices.clone(),
-            query: self.query.clone(),
-            prefilter_source: self.prefilter_source.clone(),
-            properties: self.properties.clone(),
         };
-
-        Ok(Arc::new(new_plan))
+        Ok(Arc::new(plan))
     }
 
     fn execute(
@@ -658,7 +581,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             .try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
+            schema,
             per_index_stream
                 .and_then(move |(part_ids, index_uuid)| {
                     let ds = ds.clone();
@@ -687,9 +610,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             }
                             PreFilterSource::None => None,
                             PreFilterSource::ProvidedRowIds(row_id_mask) => {
-                                // Here you would use your implementation that can handle the provided row IDs directly.
-                                // This is a placeholder for your actual implementation.
-                                Some(Box::new(DirectRowIdFilterLoader::new(row_id_mask.clone())) as Box<dyn FilterLoader>)
+                                Some(Box::new(DirectRowIdFilterLoader::new(row_id_mask.clone()))
+                                    as Box<dyn FilterLoader>)
                             }
                         };
                         let pre_filter = Arc::new(DatasetPreFilter::new(
@@ -730,7 +652,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             .await
                     }
                 })
-                .buffered(num_cpus::get())
+                .buffered(get_num_compute_intensive_cpus())
                 .boxed(),
         )))
     }
@@ -821,7 +743,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stream = dataset
             .scan()
-            .nearest("vector", q.as_primitive(), 10)
+            .nearest("vector", q.as_primitive::<Float32Type>(), 10)
             .unwrap()
             .try_into_stream()
             .await
@@ -873,7 +795,6 @@ mod tests {
             DistanceType::L2,
         )
         .unwrap();
-        println!("{:?}", idx);
         assert_eq!(
             idx.schema().as_ref(),
             &ArrowSchema::new(vec![

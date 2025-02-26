@@ -11,17 +11,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.test;
 
 import com.lancedb.lance.JniLoader;
+import com.lancedb.lance.index.IndexParams;
+import com.lancedb.lance.ipc.Query;
+
 import java.util.List;
 import java.util.Optional;
 
 /**
- * Used by the JNI test to test the JNI FFI functionality.
- * Note that if ffi parsing errors out, the whole JVM will crash
- * or all tests will show as UnsatisfiedLinkError.
+ * Used by the JNI test to test the JNI FFI functionality. Note that if ffi parsing errors out, the
+ * whole JVM will crash or all tests will show as UnsatisfiedLinkError.
  */
 public class JniTestHelper {
   static {
@@ -36,9 +37,25 @@ public class JniTestHelper {
   public static native void parseInts(List<Integer> intsList);
 
   /**
+   * JNI parse longs test.
+   *
+   * @param longsList the given list of longs
+   */
+  public static native void parseLongs(List<Long> longsList);
+
+  /**
    * JNI parse ints opts test.
    *
    * @param intsOpt the given optional of list of integers
    */
   public static native void parseIntsOpt(Optional<List<Integer>> intsOpt);
+
+  /**
+   * JNI parse query test.
+   *
+   * @param query the optional query
+   */
+  public static native void parseQuery(Optional<Query> query);
+
+  public static native void parseIndexParams(IndexParams indexParams);
 }

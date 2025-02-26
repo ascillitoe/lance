@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::print_stdout)]
+
 use arrow::util::pretty::print_batches;
 use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::stream::StreamExt;
 use futures::TryStreamExt;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance::dataset::Dataset;
 use lance::index::vector::VectorIndexParams;
@@ -59,7 +61,7 @@ enum Commands {
         #[arg(short = 't', long = "type", value_enum, value_name = "TYPE")]
         index_type: Option<IndexType>,
 
-        /// Nunber of IVF partitions. Only useful when the index type is 'ivf-pq'.
+        /// Number of IVF partitions. Only useful when the index type is 'ivf-pq'.
         #[arg(short = 'p', long, default_value_t = 64, value_name = "NUM")]
         num_partitions: usize,
 
